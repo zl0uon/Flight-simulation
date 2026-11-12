@@ -1,0 +1,1163 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>핸드 플라이트</title>
+<style>
+  :root {
+    --bg: #0e1420;
+    --panel: rgba(23, 32, 49, .92);
+    --panel2: #1e2a3f;
+    --line: #2b3a55;
+    --text: #e8eef8;
+    --muted: #93a3bd;
+    --accent: #ff9f1c;
+    --ok: #3ddc97;
+    --warn: #ffd23f;
+    --bad: #ff5a5f;
+    --blue: #4ea8ff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  }
+  #gl, #hud { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { pointer-events: none; }
+
+  .topbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 5;
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+    padding: 10px 16px; background: rgba(14, 20, 32, .78); border-bottom: 1px solid var(--line);
+  }
+  .topbar h1 { margin: 0; font-size: 19px; }
+  .topbar h1 span { color: var(--accent); }
+  .topbar p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    padding: 8px 13px; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 600; font-family: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #1a1205; border-color: var(--accent); }
+  button.active { outline: 2px solid var(--accent); }
+  label.toggle { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+
+  .cam {
+    position: fixed; left: 16px; bottom: 16px; width: 300px; z-index: 4;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px;
+  }
+  .cam-wrap { position: relative; width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: 8px; overflow: hidden; }
+  .cam-wrap video, .cam-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .cam-wrap video { transform: scaleX(-1); }
+  .cam-placeholder {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    color: var(--muted); font-size: 13px; padding: 14px; line-height: 1.6;
+  }
+  .hands { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+  .hand { background: var(--panel2); border-radius: 8px; padding: 6px 8px; border: 1px solid transparent; }
+  .hand.on { border-color: var(--line); }
+  .hand .k { font-size: 11px; color: var(--muted); }
+  .hand .v { font-size: 15px; font-weight: 700; margin-top: 2px; min-height: 20px; }
+  .hand .i { font-size: 12px; color: var(--muted); margin-top: 2px; min-height: 16px; }
+  .hold-bar { height: 4px; background: rgba(255, 255, 255, .08); border-radius: 2px; overflow: hidden; margin-top: 5px; }
+  .hold-bar div { height: 100%; width: 0; background: var(--accent); }
+
+  .guide {
+    position: fixed; right: 16px; top: 70px; width: 300px; z-index: 4; max-height: calc(100% - 90px); overflow: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+  }
+  .guide h2 { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
+  .guide h3 { margin: 12px 0 6px; font-size: 13px; }
+  .guide h3.r { color: var(--accent); }
+  .guide h3.l { color: var(--blue); }
+  .g-row { display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: center; padding: 5px 0; border-top: 1px solid rgba(255, 255, 255, .05); }
+  .g-row .e { font-size: 22px; text-align: center; }
+  .g-row b { font-size: 13px; }
+  .g-row div div { font-size: 12px; color: var(--muted); }
+  .guide .note { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 10px 0 0; }
+  kbd { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 11px; }
+
+  .overlay {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 6;
+    background: rgba(10, 15, 25, .94); border: 1px solid var(--line); border-radius: 14px;
+    padding: 22px 28px; text-align: center; min-width: 320px; max-width: min(560px, calc(100% - 32px));
+  }
+  .overlay h3 { margin: 0 0 8px; font-size: 22px; }
+  .overlay p { margin: 6px 0; color: var(--muted); line-height: 1.55; }
+  .overlay .big { font-size: 46px; font-weight: 800; color: var(--accent); margin: 6px 0; }
+  .overlay table { margin: 10px auto 0; border-collapse: collapse; font-size: 14px; }
+  .overlay td { padding: 3px 10px; text-align: left; }
+  .overlay td:last-child { text-align: right; font-weight: 700; }
+  .overlay .btns { display: flex; gap: 8px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
+  .hidden { display: none !important; }
+
+  .toast {
+    position: fixed; left: 50%; top: 120px; transform: translateX(-50%); z-index: 7;
+    background: var(--bad); color: #fff; font-weight: 700; padding: 10px 18px; border-radius: 10px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px); text-align: center;
+  }
+  .toast.show { opacity: 1; }
+  .toast.ok { background: #1f8a5c; }
+  .toast.warn { background: #b8860b; }
+
+  @media (max-width: 900px) {
+    .cam { width: 200px; }
+    .guide { left: 16px; right: 16px; width: auto; }
+  }
+</style>
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="hud"></canvas>
+
+<header class="topbar">
+  <div>
+    <h1>✋ <span>핸드 플라이트</span></h1>
+    <p>손 모양만으로 항공기를 조종하는 제스처 비행 제어 시스템</p>
+  </div>
+  <div class="controls">
+    <button id="btnCam" class="primary">📷 카메라 켜기</button>
+    <button id="btnMission">🛫 비행 미션</button>
+    <button id="btnFree">🕊 자유 비행</button>
+    <button id="btnCal">🎯 중립 보정</button>
+    <button id="btnGuide">📖 조작법</button>
+    <label class="toggle"><input type="checkbox" id="chkSound" checked> 소리</label>
+  </div>
+</header>
+
+<section class="cam">
+  <div class="cam-wrap">
+    <video id="video" playsinline muted></video>
+    <canvas id="camCanvas"></canvas>
+    <div class="cam-placeholder" id="camPlaceholder"><div>
+      카메라를 켜고 양손이 화면에 들어오게 앉아 주세요.<br><br>
+      카메라가 없으면 키보드로도 조종할 수 있어요.<br>
+      <kbd>←→↑↓</kbd> 조종 · <kbd>W</kbd><kbd>S</kbd> 추력
+    </div></div>
+  </div>
+  <div class="hands">
+    <div class="hand" id="cardR">
+      <div class="k">오른손 · 조종간</div>
+      <div class="v" id="rShape">—</div>
+      <div class="i" id="rInfo"></div>
+      <div class="hold-bar"><div id="rBar"></div></div>
+    </div>
+    <div class="hand" id="cardL">
+      <div class="k">왼손 · 스로틀</div>
+      <div class="v" id="lShape">—</div>
+      <div class="i" id="lInfo"></div>
+      <div class="hold-bar"><div id="lBar"></div></div>
+    </div>
+  </div>
+</section>
+
+<aside class="guide hidden" id="guide">
+  <h2>손 제스처 조작법</h2>
+  <h3 class="r">오른손: 조종간</h3>
+  <div class="g-row"><div class="e">🖐</div><div><b>손을 좌우로 기울이기</b><div>기울인 방향으로 선회 (뱅크)</div></div></div>
+  <div class="g-row"><div class="e">↕️</div><div><b>손을 위·아래로</b><div>기수 올림 / 내림 (상승·강하)</div></div></div>
+  <div class="g-row"><div class="e">✊</div><div><b>주먹</b><div>자동 수평: 날개와 기수를 수평으로</div></div></div>
+  <div class="g-row"><div class="e">✌️</div><div><b>브이 1초 유지</b><div>시점 전환 (뒤에서 보기 ↔ 조종석)</div></div></div>
+  <h3 class="l">왼손: 스로틀</h3>
+  <div class="g-row"><div class="e">🖐</div><div><b>편 손을 위·아래로</b><div>위로 올릴수록 추력 증가</div></div></div>
+  <div class="g-row"><div class="e">✊</div><div><b>주먹</b><div>추력 고정 (손을 움직여도 그대로)</div></div></div>
+  <div class="g-row"><div class="e">✌️</div><div><b>브이 1초 유지</b><div>랜딩기어 올림 / 내림</div></div></div>
+  <div class="g-row"><div class="e">👍</div><div><b>엄지척 1초 유지</b><div>플랩 단계 변경 (0 → 1 → 2)</div></div></div>
+  <p class="note">
+    🛟 <b>안전 장치</b>: 손이 화면에서 사라지면 항공기가 자동으로 수평 비행을 유지해요.<br>
+    지상에서 추력을 0으로 내리면 브레이크가 걸려요.<br><br>
+    ⌨️ 키보드: <kbd>←→</kbd> 선회 <kbd>↑↓</kbd> 기수 <kbd>W</kbd><kbd>S</kbd> 추력
+    <kbd>G</kbd> 기어 <kbd>F</kbd> 플랩 <kbd>C</kbd> 시점 <kbd>P</kbd> 일시정지 <kbd>R</kbd> 다시 시작
+  </p>
+</aside>
+
+<div class="overlay" id="overlay"></div>
+<div class="toast" id="toast"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const REMOTE_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const D2R = Math.PI / 180, R2D = 180 / Math.PI, G = 9.81;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const approach = (cur, target, step) => cur + clamp(target - cur, -step, step);
+const deadzone = (v, dz) => Math.abs(v) < dz ? 0 : Math.sign(v) * (Math.abs(v) - dz) / (1 - dz);
+const $ = id => document.getElementById(id);
+
+// ───────── 소리 ─────────
+let audioCtx = null, engine = null;
+function audio() {
+  audioCtx ??= new AudioContext();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+function beep(freq = 880, dur = 0.12, type = "sine", vol = 0.15) {
+  if (!$("chkSound").checked) return;
+  try {
+    const a = audio(), o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g).connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur);
+  } catch {}
+}
+function say(text) {
+  if (!$("chkSound").checked || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "ko-KR"; u.rate = 1.1;
+  speechSynthesis.speak(u);
+}
+function startEngine() {
+  if (engine) return;
+  try {
+    const a = audio(), o = a.createOscillator(), f = a.createBiquadFilter(), g = a.createGain();
+    o.type = "sawtooth"; f.type = "lowpass"; f.frequency.value = 380; g.gain.value = 0;
+    o.connect(f).connect(g).connect(a.destination);
+    o.start();
+    engine = { o, g };
+  } catch {}
+}
+function updateEngine() {
+  if (!engine) return;
+  const t = audioCtx.currentTime, on = $("chkSound").checked && game.state === "flying";
+  engine.o.frequency.setTargetAtTime(48 + plane.throttle * 70, t, 0.1);
+  engine.g.gain.setTargetAtTime(on ? 0.025 + plane.throttle * 0.045 : 0, t, 0.1);
+}
+
+const toastEl = $("toast");
+let toastTimer = 0;
+function toast(text, kind = "bad", ms = 2200) {
+  toastEl.textContent = text;
+  toastEl.className = `toast show ${kind === "bad" ? "" : kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), ms);
+}
+const overlayEl = $("overlay");
+function showOverlay(html) { overlayEl.innerHTML = html; overlayEl.classList.remove("hidden"); }
+function hideOverlay() { overlayEl.classList.add("hidden"); }
+
+// ───────── 3D 장면 ─────────
+const RW_LEN = 1200, RW_W = 45;             // 활주로 (m), z = +600 쪽이 착륙 시작점
+const THRESHOLD = new THREE.Vector3(0, 0, RW_LEN / 2);
+const GEAR_H = 1.4;                          // 바퀴 바닥에서 기체 중심까지 높이
+
+const renderer = new THREE.WebGLRenderer({ canvas: $("gl"), antialias: true, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+const scene = new THREE.Scene();
+const SKY = 0xa8cdf0;
+scene.background = new THREE.Color(SKY);
+scene.fog = new THREE.Fog(SKY, 2500, 13000);
+const camera = new THREE.PerspectiveCamera(65, 1, 0.5, 30000);
+scene.add(new THREE.HemisphereLight(0xe4f0ff, 0x4a6b3a, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(-1, 2, 0.8);
+scene.add(sun);
+
+function canvasTex(w, h, draw, repeat) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  draw(c.getContext("2d"), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat, repeat); }
+  return t;
+}
+
+// 지면: 밭처럼 보이도록 초록 계열 조각을 섞은 반복 텍스처
+const grassTex = canvasTex(512, 512, (c, w, h) => {
+  const greens = ["#5f8f47", "#6a9a4f", "#58843f", "#7aa158", "#678c44"];
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+    c.fillStyle = greens[(x * 3 + y * 7) % greens.length];
+    c.fillRect(x * w / 4, y * h / 4, w / 4, h / 4);
+  }
+  for (let i = 0; i < 5000; i++) {
+    c.fillStyle = `rgba(${Math.random() < 0.5 ? "30,60,20" : "150,190,110"},.12)`;
+    c.fillRect(Math.random() * w, Math.random() * h, 2, 2);
+  }
+}, 160);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(60000, 60000), new THREE.MeshLambertMaterial({ map: grassTex }));
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+// 활주로: 텍스처 좌표를 미터 단위로 그림
+const runwayTex = canvasTex(128, 2048, (c, w, h) => {
+  c.fillStyle = "#3a3d42"; c.fillRect(0, 0, w, h);
+  c.scale(w / RW_W, h / RW_LEN);
+  c.fillStyle = "#e9ecef";
+  c.fillRect(1, 0, 0.9, RW_LEN); c.fillRect(RW_W - 1.9, 0, 0.9, RW_LEN);
+  for (const end of [0, RW_LEN]) {
+    const dir = end === 0 ? 1 : -1;
+    for (let i = 0; i < 8; i++) {
+      const x = 4 + i * 5.2 + (i >= 4 ? 2.2 : 0);
+      c.fillRect(x, end + dir * 6 - (dir < 0 ? 30 : 0), 1.8, 30);
+    }
+    for (const x of [7, RW_W - 17]) c.fillRect(x, end + dir * 300 - (dir < 0 ? 45 : 0), 10, 45);
+    for (const d of [150, 450]) for (const x of [9, RW_W - 15]) c.fillRect(x, end + dir * d - (dir < 0 ? 22 : 0), 6, 22);
+  }
+  for (let z = 60; z < RW_LEN - 80; z += 50) c.fillRect(RW_W / 2 - 0.45, z, 0.9, 30);
+});
+const runway = new THREE.Mesh(new THREE.PlaneGeometry(RW_W, RW_LEN), new THREE.MeshLambertMaterial({ map: runwayTex }));
+runway.rotation.x = -Math.PI / 2;
+runway.position.y = 0.08;
+scene.add(runway);
+const shoulder = new THREE.Mesh(new THREE.PlaneGeometry(RW_W + 30, RW_LEN + 120), new THREE.MeshLambertMaterial({ color: 0x8a8f86 }));
+shoulder.rotation.x = -Math.PI / 2;
+shoulder.position.y = 0.04;
+scene.add(shoulder);
+
+// 활주로 등화
+{
+  const pts = [];
+  for (let z = -RW_LEN / 2; z <= RW_LEN / 2; z += 60) for (const x of [-RW_W / 2 - 2, RW_W / 2 + 2]) pts.push([x, z, 0xfff6d5]);
+  for (let x = -RW_W / 2; x <= RW_W / 2; x += 4) { pts.push([x, RW_LEN / 2 + 3, 0x3ddc97]); pts.push([x, -RW_LEN / 2 - 3, 0xff5a5f]); }
+  // 진입등: 착륙 방향 앞쪽으로 300m
+  for (let d = 30; d <= 300; d += 30) for (const x of [-4, 0, 4]) pts.push([x, RW_LEN / 2 + d, 0xfff6d5]);
+  const geo = new THREE.BoxGeometry(0.8, 0.6, 0.8);
+  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshBasicMaterial(), pts.length);
+  const m = new THREE.Matrix4(), col = new THREE.Color();
+  pts.forEach(([x, z, c], i) => { m.makeTranslation(x, 0.3, z); mesh.setMatrixAt(i, m); mesh.setColorAt(i, col.set(c)); });
+  scene.add(mesh);
+}
+
+// 관제탑과 격납고
+{
+  const concrete = new THREE.MeshLambertMaterial({ color: 0xd9dde3 });
+  const glass = new THREE.MeshLambertMaterial({ color: 0x2a4d6e });
+  const tower = new THREE.Mesh(new THREE.CylinderGeometry(3, 4, 30, 12), concrete);
+  tower.position.set(-140, 15, 80); scene.add(tower);
+  const cab = new THREE.Mesh(new THREE.CylinderGeometry(7, 5.5, 6, 12), glass);
+  cab.position.set(-140, 33, 80); scene.add(cab);
+  const apron = new THREE.Mesh(new THREE.PlaneGeometry(160, 400), new THREE.MeshLambertMaterial({ color: 0x9a9e98 }));
+  apron.rotation.x = -Math.PI / 2; apron.position.set(-150, 0.05, -100); scene.add(apron);
+  for (let i = 0; i < 4; i++) {
+    const h = new THREE.Mesh(new THREE.BoxGeometry(50, 16, 40), new THREE.MeshLambertMaterial({ color: i % 2 ? 0xb8c2cf : 0xc9d1db }));
+    h.position.set(-200, 8, -260 + i * 60); scene.add(h);
+  }
+}
+
+// 나무, 마을, 산, 구름
+const rand = (() => { let s = 7; return () => (s = (s * 16807) % 2147483647) / 2147483647; })();
+{
+  const N = 900;
+  const trees = new THREE.InstancedMesh(new THREE.ConeGeometry(5, 16, 7), new THREE.MeshLambertMaterial({ color: 0x2f6b34 }), N);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
+  for (let i = 0; i < N; i++) {
+    let x, z;
+    do { x = (rand() - 0.5) * 12000; z = (rand() - 0.5) * 12000; }
+    while (Math.abs(x) < 320 && Math.abs(z) < 3000);
+    const k = 0.6 + rand() * 1.2;
+    m.compose(p.set(x, 8 * k, z), q, s.set(k, k, k));
+    trees.setMatrixAt(i, m);
+  }
+  scene.add(trees);
+
+  const B = 160;
+  const town = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshLambertMaterial(), B);
+  const col = new THREE.Color();
+  for (let i = 0; i < B; i++) {
+    const w = 15 + rand() * 25, hgt = 10 + rand() * (rand() < 0.15 ? 90 : 30);
+    m.compose(p.set(-2600 + (rand() - 0.5) * 1400, hgt / 2, -1600 + (rand() - 0.5) * 1400), q, s.set(w, hgt, w));
+    town.setMatrixAt(i, m);
+    town.setColorAt(i, col.setHSL(0.58, 0.08, 0.6 + rand() * 0.25));
+  }
+  scene.add(town);
+
+  const mtnMat = new THREE.MeshLambertMaterial({ color: 0x6d8a72, flatShading: true });
+  for (let i = 0; i < 18; i++) {
+    const a = (i / 18) * Math.PI * 2 + rand() * 0.3, d = 8000 + rand() * 3000;
+    const r = 900 + rand() * 1400, hgt = 500 + rand() * 900;
+    const mtn = new THREE.Mesh(new THREE.ConeGeometry(r, hgt, 7), mtnMat);
+    mtn.position.set(Math.cos(a) * d, hgt / 2, Math.sin(a) * d);
+    mtn.rotation.y = rand() * 3;
+    scene.add(mtn);
+  }
+
+  const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.88 });
+  const puff = new THREE.SphereGeometry(1, 10, 8);
+  for (let i = 0; i < 28; i++) {
+    const cl = new THREE.Group();
+    for (let j = 0; j < 5; j++) {
+      const s2 = 50 + rand() * 60;
+      const m2 = new THREE.Mesh(puff, cloudMat);
+      m2.scale.set(s2 * 1.6, s2 * 0.6, s2);
+      m2.position.set((rand() - 0.5) * 160, (rand() - 0.5) * 20, (rand() - 0.5) * 100);
+      cl.add(m2);
+    }
+    cl.position.set((rand() - 0.5) * 14000, 500 + rand() * 500, (rand() - 0.5) * 14000);
+    scene.add(cl);
+  }
+}
+
+// 항공기 모델 (고익 단발 훈련기, 기수가 -z)
+function makePlane() {
+  const g = new THREE.Group();
+  const white = new THREE.MeshLambertMaterial({ color: 0xf4f6fa });
+  const orange = new THREE.MeshLambertMaterial({ color: 0xff9f1c });
+  const dark = new THREE.MeshLambertMaterial({ color: 0x26324a });
+  const add = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); g.add(m); return m; };
+  const fus = add(new THREE.CylinderGeometry(0.28, 0.62, 7, 14), white, 0, 0, 0.5);
+  fus.rotation.x = Math.PI / 2;
+  add(new THREE.BoxGeometry(1.0, 0.55, 1.7), dark, 0, 0.55, -1.0);
+  add(new THREE.BoxGeometry(11, 0.18, 1.5), white, 0, 0.82, -0.7);
+  add(new THREE.BoxGeometry(0.6, 0.2, 1.52), orange, -5.3, 0.82, -0.7);
+  add(new THREE.BoxGeometry(0.6, 0.2, 1.52), orange, 5.3, 0.82, -0.7);
+  add(new THREE.BoxGeometry(3.6, 0.12, 0.9), white, 0, 0.1, 3.7);
+  add(new THREE.BoxGeometry(0.12, 1.5, 1.1), orange, 0, 0.8, 3.6);
+  add(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshBasicMaterial({ color: 0xff3030 }), -5.62, 0.82, -0.7);
+  add(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshBasicMaterial({ color: 0x30ff60 }), 5.62, 0.82, -0.7);
+  const spinner = add(new THREE.ConeGeometry(0.3, 0.6, 10), dark, 0, 0, -3.25);
+  spinner.rotation.x = -Math.PI / 2;
+  const prop = new THREE.Group();
+  prop.position.set(0, 0, -3.2);
+  const blade = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.16, 0.05), dark);
+  prop.add(blade);
+  g.add(prop);
+  const gear = new THREE.Group();
+  const wheelGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.22, 12);
+  for (const [x, z] of [[-1.3, -0.2], [1.3, -0.2], [0, -2.4]]) {
+    const w = new THREE.Mesh(wheelGeo, dark);
+    w.rotation.z = Math.PI / 2; w.position.set(x, -1.08, z); gear.add(w);
+    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.8, 0.1), white);
+    strut.position.set(x * 0.8, -0.65, z); gear.add(strut);
+  }
+  g.add(gear);
+  g.userData = { prop, gear };
+  return g;
+}
+const planeMesh = makePlane();
+scene.add(planeMesh);
+
+// ───────── 미션 링 ─────────
+const RING_R = 22, RING_HIT = 27;
+const RINGS = [
+  [0, 60, -1100], [250, 110, -1750], [750, 140, -1950], [1150, 140, -1350],
+  [1250, 120, -300], [1000, 100, 700], [450, 80, 1900], [0, 45, 1450],
+].map(([x, y, z]) => ({ c: new THREE.Vector3(x, y, z) }));
+{
+  const geo = new THREE.TorusGeometry(RING_R, 1.5, 10, 48);
+  RINGS.forEach((r, i) => {
+    const prev = i ? RINGS[i - 1].c : new THREE.Vector3(0, 0, RW_LEN / 2 - 40);
+    const next = i < RINGS.length - 1 ? RINGS[i + 1].c : THRESHOLD;
+    r.n = next.clone().sub(prev).normalize();
+    r.mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }));
+    r.mesh.position.copy(r.c);
+    r.mesh.lookAt(r.c.clone().add(r.n));
+    r.mesh.visible = false;
+    scene.add(r.mesh);
+  });
+}
+function paintRings() {
+  RINGS.forEach((r, i) => {
+    r.mesh.visible = game.mode === "mission";
+    const m = r.mesh.material;
+    if (i < game.ringIdx) { m.color.set(r.missed ? 0xff5a5f : 0x3ddc97); m.opacity = 0.25; }
+    else if (i === game.ringIdx) { m.color.set(0xff9f1c); m.opacity = 1; }
+    else { m.color.set(0xffffff); m.opacity = 0.55; }
+  });
+}
+
+// 폭발 효과
+const effects = [];
+function explode(pos) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), new THREE.MeshBasicMaterial({ color: 0xff7a1c, transparent: true }));
+  m.position.copy(pos);
+  scene.add(m);
+  effects.push({ m, t: 0 });
+}
+function updateEffects(dt) {
+  for (const e of [...effects]) {
+    e.t += dt;
+    e.m.scale.setScalar(2 + e.t * 30);
+    e.m.material.opacity = Math.max(0, 1 - e.t / 1.5);
+    if (e.t > 1.5) { scene.remove(e.m); effects.splice(effects.indexOf(e), 1); }
+  }
+}
+
+// ───────── 비행 모델 (게임용으로 단순화) ─────────
+const THRUST = 9;                 // 최대 추력 가속도 (m/s²)
+const DRAG_K = 0.00124;           // 최대 속도 ≈ 85 m/s
+const VS = [28, 25, 22];          // 플랩 단계별 실속 속도 (m/s)
+const FLAP_DRAG = [1, 1.25, 1.6];
+const MAX_BANK = 55 * D2R, MAX_PITCH = 18 * D2R;
+
+const plane = { pos: new THREE.Vector3() };
+function resetPlane() {
+  Object.assign(plane, {
+    v: 0, vs: 0, psi: 0, theta: 0, phi: 0, throttle: 0, gear: true, flaps: 1,
+    onGround: true, stall: false, touchdown: null, hasFlown: false,
+  });
+  plane.pos.set(0, 0, RW_LEN / 2 - 40);
+  ctl.roll = ctl.pitch = 0;
+  camSnap = true;
+}
+const onRunway = (x, z) => Math.abs(x) < RW_W / 2 + 2 && Math.abs(z) < RW_LEN / 2 + 5;
+
+function stepPlane(dt) {
+  const p = plane;
+  const vs0 = VS[p.flaps];
+  const drag = DRAG_K * p.v * p.v * FLAP_DRAG[p.flaps] * (p.gear ? 1.15 : 1);
+  const lift = (p.v / vs0) ** 2;
+
+  if (p.onGround) {
+    p.phi = approach(p.phi, 0, dt);
+    const canRotate = p.v > vs0 * 1.05;
+    p.theta = approach(p.theta, canRotate ? Math.max(0, ctl.pitch) * 14 * D2R : 0, 10 * D2R * dt);
+    const brake = p.throttle < 0.05 ? 4 : 0;
+    p.v = Math.max(0, p.v + (THRUST * p.throttle - drag - 0.3 - brake) * dt);
+    p.psi += ctl.roll * 0.4 * Math.min(1, p.v / 6) * dt;   // 지상에서는 조종간 기울이기 = 앞바퀴 조향
+    p.stall = false;
+  } else {
+    p.stall = lift < 1;
+    let tPitch = ctl.pitch * MAX_PITCH;
+    if (p.stall) tPitch = Math.min(tPitch, -12 * D2R * (1 - lift));   // 실속하면 기수가 떨어짐
+    p.phi = approach(p.phi, ctl.roll * MAX_BANK, 60 * D2R * dt);
+    p.theta = approach(p.theta, tPitch, 16 * D2R * dt);
+    const gamma = Math.atan2(p.vs, Math.max(p.v, 1));
+    p.v = Math.max(0, p.v + (THRUST * p.throttle - drag - G * Math.sin(gamma)) * dt);
+    p.psi += G * Math.tan(p.phi) / Math.max(p.v, 15) * dt;
+  }
+  // 양력이 부족한 만큼 가라앉음 (기울이면 수직 양력이 줄어듦)
+  const sink = Math.max(0, 1 - lift * Math.sqrt(Math.cos(p.phi))) * 20;
+  p.vs = p.v * Math.sin(p.theta) - sink;
+
+  const hv = p.v * Math.cos(p.theta);
+  p.pos.x += Math.sin(p.psi) * hv * dt;
+  p.pos.z -= Math.cos(p.psi) * hv * dt;
+  p.pos.y = Math.min(3000, p.pos.y + p.vs * dt);
+
+  if (p.onGround) {
+    if (p.vs > 0) {
+      p.onGround = false;
+      p.touchdown = null;
+      if (!p.hasFlown) { p.hasFlown = true; toast("이륙! 🛫", "ok", 1500); say("이륙"); }
+      game.stopWarned = false;
+    } else {
+      p.pos.y = 0; p.vs = 0;
+      if (p.v > 12 && !onRunway(p.pos.x, p.pos.z)) return crash("활주로를 벗어났어요");
+    }
+  } else if (p.pos.y <= 0) {
+    p.pos.y = 0;
+    touchdown();
+  }
+}
+
+function touchdown() {
+  const p = plane, sink = -p.vs, fpm = Math.round(sink * 196.85);
+  if (!p.gear) return crash("랜딩기어를 내리지 않고 동체 착륙했어요");
+  if (!onRunway(p.pos.x, p.pos.z)) return crash("활주로 밖에 내려앉았어요");
+  if (sink > 4) return crash(`너무 세게 내려앉았어요 (강하율 ${fpm} ft/min)`);
+  if (Math.abs(p.phi) > 12 * D2R) return crash("날개 끝이 활주로에 닿았어요");
+  if (p.theta < -5 * D2R) return crash("앞바퀴부터 활주로에 부딪혔어요");
+  p.onGround = true;
+  p.vs = 0; p.phi = 0; p.theta = Math.max(0, p.theta);
+  p.touchdown = { sink, x: p.pos.x, z: p.pos.z };
+  beep(sink < 1.5 ? 1046 : 660, 0.15);
+  toast(sink < 1.5 ? `부드러운 착지! (${fpm} ft/min)` : `착지 (${fpm} ft/min) · 추력을 내려 정지하세요`, "ok", 2500);
+  say("착지. 추력을 내려 정지하세요");
+}
+
+// ───────── 게임 흐름 ─────────
+const game = { state: "menu", mode: "free", t: 0, ringIdx: 0, stopWarned: false, lastFarWarn: 0, lastStallBeep: 0 };
+const prevPos = new THREE.Vector3();
+
+function startGame(mode) {
+  game.mode = mode;
+  game.state = "flying";
+  game.t = 0;
+  game.ringIdx = 0;
+  game.stopWarned = false;
+  RINGS.forEach(r => r.missed = false);
+  resetPlane();
+  prevPos.copy(plane.pos);
+  paintRings();
+  hideOverlay();
+  startEngine();
+  $("btnMission").classList.toggle("active", mode === "mission");
+  $("btnFree").classList.toggle("active", mode === "free");
+  if (mode === "mission") {
+    toast("추력 올려 이륙 → 주황색 링 8개 통과 → 활주로에 착륙", "ok", 4500);
+    say("왼손을 올려 추력을 높이고 이륙하세요");
+  } else {
+    toast("자유 비행: 마음껏 날아 보고 활주로에 착륙해 보세요", "ok", 3500);
+  }
+}
+
+function crash(reason) {
+  if (game.state !== "flying") return;
+  game.state = "over";
+  explode(planeMesh.position);
+  planeMesh.visible = false;
+  beep(140, 0.6, "sawtooth", 0.25);
+  say(reason);
+  showOverlay(`<h3>💥 비행 실패</h3><p>${reason}</p>
+    <p>추력, 기어, 강하 속도를 확인하며 다시 도전해 보세요.</p>
+    <div class="btns"><button class="primary" data-act="retry">다시 하기 (R)</button><button data-act="menu">처음으로</button></div>`);
+}
+
+function checkRings() {
+  if (game.mode !== "mission" || game.ringIdx >= RINGS.length) return;
+  const r = RINGS[game.ringIdx];
+  const d0 = prevPos.clone().sub(r.c).dot(r.n), d1 = plane.pos.clone().sub(r.c).dot(r.n);
+  if (d0 < 0 && d1 >= 0) {
+    const hit = prevPos.clone().lerp(plane.pos, d0 / (d0 - d1));
+    if (hit.distanceTo(r.c) < RING_HIT) {
+      beep(1318, 0.12); setTimeout(() => beep(1760, 0.15), 110);
+      toast(`링 ${game.ringIdx + 1} 통과! ⭕`, "ok", 1200);
+    } else {
+      r.missed = true;
+      beep(300, 0.25, "square");
+      toast(`링 ${game.ringIdx + 1}을(를) 빗나갔어요 (-8점)`, "warn", 1600);
+    }
+    game.ringIdx++;
+    paintRings();
+    if (game.ringIdx === RINGS.length) {
+      toast("모든 링 통과! 기어 DOWN · 플랩 2 확인하고 활주로에 착륙하세요", "ok", 4000);
+      say("활주로에 착륙하세요. 기어와 플랩을 확인하세요");
+    }
+  }
+}
+
+function checkStopped() {
+  const p = plane;
+  if (!p.onGround || !p.touchdown || p.v > 0.5) return;
+  if (game.mode === "mission" && game.ringIdx < RINGS.length) {
+    if (!game.stopWarned) { game.stopWarned = true; toast("아직 남은 링이 있어요. 다시 이륙하세요!", "warn", 3000); }
+    return;
+  }
+  finish();
+}
+
+function finish() {
+  game.state = "over";
+  const td = plane.touchdown;
+  const fromThr = THRESHOLD.z - td.z;
+  const zoneOff = fromThr < 150 ? 150 - fromThr : fromThr > 450 ? fromThr - 450 : 0;
+  const missed = RINGS.filter(r => r.missed).length;
+  const pSink = Math.min(25, td.sink * 7);
+  const pCenter = Math.min(20, Math.abs(td.x) * 1.2);
+  const pZone = Math.min(15, zoneOff * 0.05);
+  const pRings = game.mode === "mission" ? missed * 8 : 0;
+  const score = Math.max(0, Math.round(100 - pSink - pCenter - pZone - pRings));
+  const grade = score >= 90 ? "S" : score >= 75 ? "A" : score >= 55 ? "B" : "C";
+  beep(1046, 0.15); setTimeout(() => beep(1318, 0.25), 150);
+  say(`착륙 성공. ${score}점`);
+  showOverlay(`<h3>✅ 착륙 성공!</h3>
+    <div class="big">${score}점 · ${grade}</div>
+    <table>
+      ${game.mode === "mission" ? `<tr><td>통과한 링</td><td>${RINGS.length - missed} / ${RINGS.length}</td></tr>` : ""}
+      <tr><td>접지 강하율</td><td>${Math.round(td.sink * 196.85)} ft/min</td></tr>
+      <tr><td>중심선 이탈</td><td>${Math.abs(td.x).toFixed(1)} m</td></tr>
+      <tr><td>접지 위치 (권장 150~450 m)</td><td>${Math.round(fromThr)} m</td></tr>
+      <tr><td>비행 시간</td><td>${game.t.toFixed(1)}초</td></tr>
+    </table>
+    <div class="btns"><button class="primary" data-act="retry">다시 하기 (R)</button><button data-act="menu">처음으로</button></div>`);
+}
+
+function showMenu() {
+  game.state = "menu";
+  resetPlane();
+  planeMesh.visible = true;
+  game.mode = "free";
+  paintRings();
+  $("btnMission").classList.remove("active");
+  $("btnFree").classList.remove("active");
+  showOverlay(`<h3>✋ 핸드 플라이트</h3>
+    <p>조종간도 키보드도 없이, <b>손 모양만으로</b> 항공기를 이륙시키고 착륙시켜 보세요.</p>
+    <p>🖐 <b style="color:var(--accent)">오른손</b>은 조종간: 기울이면 선회, 올리면 상승<br>
+       🖐 <b style="color:var(--blue)">왼손</b>은 스로틀: 높이 들수록 추력 증가</p>
+    <div class="btns">
+      <button class="primary" data-act="mission">🛫 비행 미션</button>
+      <button data-act="free">🕊 자유 비행</button>
+      <button data-act="guide">📖 조작법</button>
+    </div>`);
+}
+
+overlayEl.addEventListener("click", e => {
+  const act = e.target.closest("button")?.dataset.act;
+  if (act === "retry") startGame(game.mode);
+  else if (act === "menu") showMenu();
+  else if (act === "mission" || act === "free") startGame(act);
+  else if (act === "guide") $("guide").classList.toggle("hidden");
+});
+
+function togglePause() {
+  if (game.state === "flying") {
+    game.state = "paused";
+    showOverlay(`<h3>⏸ 일시정지</h3><p>P 키를 누르면 계속해요.</p>
+      <div class="btns"><button class="primary" data-act="resume">계속하기</button><button data-act="menu">처음으로</button></div>`);
+    overlayEl.querySelector("[data-act=resume]").onclick = togglePause;
+  } else if (game.state === "paused") {
+    game.state = "flying";
+    hideOverlay();
+  }
+}
+
+function toggleGear() {
+  if (plane.onGround && plane.gear) { toast("지상에서는 랜딩기어를 올릴 수 없어요", "warn"); return; }
+  plane.gear = !plane.gear;
+  beep(plane.gear ? 520 : 780, 0.18, "triangle");
+  toast(plane.gear ? "랜딩기어 DOWN ⬇" : "랜딩기어 UP ⬆", "ok", 1200);
+  say(plane.gear ? "기어 다운" : "기어 업");
+}
+function cycleFlaps() {
+  plane.flaps = (plane.flaps + 1) % 3;
+  beep(600 + plane.flaps * 150, 0.15, "triangle");
+  toast(`플랩 ${plane.flaps}단`, "ok", 1200);
+  say(`플랩 ${plane.flaps}`);
+}
+let view = "chase", camSnap = true;
+function toggleView() {
+  view = view === "chase" ? "cockpit" : "chase";
+  camSnap = true;
+  toast(view === "chase" ? "뒤에서 보기" : "조종석 시점", "ok", 1000);
+}
+
+// ───────── 손 인식 ─────────
+const video = $("video"), camCanvas = $("camCanvas"), cctx = camCanvas.getContext("2d");
+let landmarker = null, camOn = false, lastVideoTime = -1;
+
+async function loadLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(`${MP}/wasm`);
+  // 프로젝트의 Models 폴더 모델을 먼저 쓰고, 없으면 원격 모델
+  for (const path of ["Models/hand_landmarker.task", REMOTE_MODEL]) for (const delegate of ["GPU", "CPU"]) {
+    try {
+      return await HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: path, delegate },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.5,
+      });
+    } catch (err) { console.warn(path, delegate, err); }
+  }
+  throw new Error("손 인식 모델을 불러오지 못했어요");
+}
+
+$("btnCam").addEventListener("click", async e => {
+  if (camOn) return;
+  const btn = e.currentTarget, ph = $("camPlaceholder");
+  btn.textContent = "⏳ 준비 중...";
+  startEngine();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    ph.textContent = "AI 손 인식 모델을 불러오는 중...";
+    landmarker = await loadLandmarker();
+    camCanvas.width = video.videoWidth;
+    camCanvas.height = video.videoHeight;
+    ph.classList.add("hidden");
+    camOn = true;
+    btn.textContent = "📷 카메라 켜짐";
+    btn.classList.remove("primary");
+    toast("오른손을 편하게 펴서 1초 들고 있으면 중립 위치가 자동으로 맞춰져요", "ok", 4000);
+  } catch (err) {
+    console.error(err);
+    ph.innerHTML = "카메라를 켤 수 없어요.<br>권한을 허용했는지, localhost로 열었는지 확인해 주세요.<br><br>키보드로도 조종할 수 있어요.";
+    btn.textContent = "📷 다시 시도";
+  }
+});
+
+const SHAPES = { open: "🖐 펴기", fist: "✊ 주먹", v: "✌️ 브이", thumb: "👍 엄지척", other: "… 기타" };
+const HOLD_TRIGGER = 1.0;   // ✌️ 👍 를 이만큼(초) 유지하면 실행
+// 중립 위치: 오른손 높이와 기울기, 왼손 스로틀 범위 (화면 비율)
+const CAL = { y: 0.5, ang: 0, thrLow: 0.8, thrHigh: 0.25, done: false, pending: false };
+
+function analyzeHand(lm, w) {
+  // 3D 월드 좌표(미터)로 판정해서 카메라와의 거리와 무관하게
+  const d3 = (a, b) => Math.hypot(w[a].x - w[b].x, w[a].y - w[b].y, w[a].z - w[b].z);
+  const ext = (tip, pip) => d3(0, tip) > d3(0, pip);
+  const idx = ext(8, 6), mid = ext(12, 10), ring = ext(16, 14), pinky = ext(20, 18);
+  const n = idx + mid + ring + pinky;
+  const palm2d = Math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y);
+  const thumbUp = n === 0 && d3(4, 9) / d3(0, 9) > 0.9 && lm[5].y - lm[4].y > 0.4 * palm2d;
+  const shape = thumbUp ? "thumb" : n === 0 ? "fist" : idx && mid && !ring && !pinky ? "v" : n >= 3 ? "open" : "other";
+  // 거울 화면 기준 좌표. 기울기는 손목→중지 뿌리 방향 (0 = 똑바로, + = 시계 방향)
+  const aspect = (video.videoWidth || 4) / (video.videoHeight || 3);
+  const dx = -(lm[9].x - lm[0].x) * aspect, dy = lm[9].y - lm[0].y;
+  return {
+    shape,
+    cx: 1 - (lm[0].x + lm[9].x) / 2,
+    cy: (lm[0].y + lm[9].y) / 2,
+    ang: Math.atan2(dx, -dy),
+  };
+}
+
+const hands = {
+  right: { present: false, lastSeen: 0, shape: null, since: 0, fired: false, hold: 0 },
+  left: { present: false, lastSeen: 0, shape: null, since: 0, fired: false, hold: 0 },
+};
+function updateHand(st, h, now) {
+  if (!h) {
+    if (now - st.lastSeen > 250) { st.present = false; st.lm = null; st.shape = null; }
+    return;
+  }
+  const a = analyzeHand(h.lm, h.w);
+  if (a.shape !== st.shape) { st.since = now; st.fired = false; }
+  Object.assign(st, a, { present: true, lastSeen: now, lm: h.lm });
+  st.hold = (now - st.since) / 1000;
+}
+// 한 번만 실행되는 유지 제스처
+function held(st, shape, secs = HOLD_TRIGGER) {
+  if (st.shape !== shape || st.fired || st.hold < secs) return false;
+  st.fired = true;
+  return true;
+}
+
+function processHands(now) {
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = landmarker.detectForVideo(video, now);
+  const found = res.landmarks.map((lm, i) => ({ lm, w: res.worldLandmarks[i], mx: 1 - (lm[0].x + lm[9].x) / 2 }));
+  // 화면 위치로 구분: 거울 화면에서 오른쪽에 있는 손이 오른손
+  let right = null, left = null;
+  if (found.length >= 2) {
+    found.sort((a, b) => b.mx - a.mx);
+    [right, left] = found;
+  } else if (found.length === 1) {
+    if (found[0].mx > 0.5) right = found[0]; else left = found[0];
+  }
+  updateHand(hands.right, right, now);
+  updateHand(hands.left, left, now);
+
+  const R = hands.right, L = hands.left;
+  if (R.present) {
+    if ((CAL.pending || !CAL.done) && R.shape === "open" && R.hold > (CAL.pending ? 0.5 : 1)) {
+      CAL.y = R.cy; CAL.ang = R.ang; CAL.done = true; CAL.pending = false;
+      beep(988, 0.15);
+      toast("중립 위치를 맞췄어요 ✋", "ok", 1500);
+    }
+    if (held(R, "v")) toggleView();
+  }
+  if (L.present && game.state === "flying") {
+    if (held(L, "v")) toggleGear();
+    if (held(L, "thumb")) cycleFlaps();
+  }
+  drawCam();
+}
+
+const CONN = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16], [13, 17], [17, 18], [18, 19], [19, 20], [0, 17]];
+function drawCam() {
+  const W = camCanvas.width, H = camCanvas.height, c = cctx;
+  c.clearRect(0, 0, W, H);
+  c.save();
+  // 오른손 중립 높이
+  c.setLineDash([8, 8]); c.lineWidth = 2;
+  c.strokeStyle = "rgba(255,159,28,.6)";
+  c.beginPath(); c.moveTo(W * 0.5, CAL.y * H); c.lineTo(W, CAL.y * H); c.stroke();
+  c.setLineDash([]);
+  c.fillStyle = "rgba(255,159,28,.9)"; c.font = "bold 18px sans-serif";
+  c.fillText("중립", W - 50, CAL.y * H - 8);
+  // 왼손 스로틀 눈금
+  const x0 = 26, yLo = CAL.thrLow * H, yHi = CAL.thrHigh * H;
+  c.fillStyle = "rgba(0,0,0,.45)"; c.fillRect(x0 - 9, yHi, 18, yLo - yHi);
+  const ty = yLo - plane.throttle * (yLo - yHi);
+  c.fillStyle = "#4ea8ff"; c.fillRect(x0 - 9, ty, 18, yLo - ty);
+  c.fillStyle = "#fff"; c.font = "bold 16px sans-serif";
+  c.fillText("MAX", x0 + 14, yHi + 12); c.fillText("IDLE", x0 + 14, yLo);
+  for (const [st, color, label] of [[hands.right, "#ff9f1c", "조종간"], [hands.left, "#4ea8ff", "스로틀"]]) {
+    if (!st.present || !st.lm) continue;
+    const P = i => [(1 - st.lm[i].x) * W, st.lm[i].y * H];
+    c.strokeStyle = color; c.lineWidth = 4; c.lineCap = "round";
+    for (const [a, b] of CONN) {
+      const [ax, ay] = P(a), [bx, by] = P(b);
+      c.beginPath(); c.moveTo(ax, ay); c.lineTo(bx, by); c.stroke();
+    }
+    c.fillStyle = "#ffd23f";
+    for (const i of [4, 8, 12, 16, 20]) { const [x, y] = P(i); c.beginPath(); c.arc(x, y, 5, 0, Math.PI * 2); c.fill(); }
+    const [wx, wy] = P(0);
+    c.font = "bold 20px sans-serif"; c.fillStyle = color;
+    c.fillText(`${label} ${SHAPES[st.shape] ?? ""}`, wx - 50, Math.min(H - 8, wy + 30));
+  }
+  c.restore();
+}
+
+// ───────── 조종 입력 (손 / 키보드) ─────────
+const ctl = { roll: 0, pitch: 0, mode: "idle" };
+const keys = new Set();
+function updateControls(dt) {
+  const R = hands.right, L = hands.left;
+  const kRoll = (keys.has("ArrowRight") ? 1 : 0) - (keys.has("ArrowLeft") ? 1 : 0);
+  const kPitch = (keys.has("ArrowUp") ? 1 : 0) - (keys.has("ArrowDown") ? 1 : 0);
+  let tRoll = 0, tPitch = 0;
+  if (kRoll || kPitch) {
+    tRoll = kRoll; tPitch = kPitch; ctl.mode = "key";
+  } else if (R.present && R.shape !== "fist") {
+    tRoll = deadzone(clamp((R.ang - CAL.ang) / (40 * D2R), -1, 1), 0.12);
+    tPitch = deadzone(clamp((CAL.y - R.cy) / 0.2, -1, 1), 0.12);
+    ctl.mode = "hand";
+  } else {
+    ctl.mode = R.present ? "fist" : camOn ? "lost" : "idle";
+  }
+  const k = 1 - Math.exp(-dt / 0.12);
+  ctl.roll += (tRoll - ctl.roll) * k;
+  ctl.pitch += (tPitch - ctl.pitch) * k;
+
+  if (game.state !== "flying") return;
+  if (keys.has("KeyW")) plane.throttle = Math.min(1, plane.throttle + 0.5 * dt);
+  else if (keys.has("KeyS")) plane.throttle = Math.max(0, plane.throttle - 0.5 * dt);
+  else if (L.present && L.shape === "open") {
+    let t = clamp((CAL.thrLow - L.cy) / (CAL.thrLow - CAL.thrHigh), 0, 1);
+    if (t < 0.04) t = 0; else if (t > 0.96) t = 1;
+    plane.throttle += (t - plane.throttle) * (1 - Math.exp(-dt / 0.15));
+    if (Math.abs(t - plane.throttle) < 0.005) plane.throttle = t;
+  }
+}
+
+function updateHandCards() {
+  const R = hands.right, L = hands.left;
+  $("cardR").classList.toggle("on", R.present);
+  $("cardL").classList.toggle("on", L.present);
+  $("rShape").textContent = R.present ? SHAPES[R.shape] : "—";
+  $("lShape").textContent = L.present ? SHAPES[L.shape] : "—";
+  const bank = Math.round(ctl.roll * MAX_BANK * R2D), pitch = Math.round(ctl.pitch * MAX_PITCH * R2D);
+  $("rInfo").textContent = !R.present ? (camOn ? "손 없음 → 자동 수평" : "")
+    : R.shape === "fist" ? "자동 수평" : R.shape === "v" ? "유지하면 시점 전환"
+    : `뱅크 ${bank > 0 ? "R" : bank < 0 ? "L" : ""}${Math.abs(bank)}° · 기수 ${pitch > 0 ? "+" : ""}${pitch}°`;
+  $("lInfo").textContent = !L.present ? (camOn ? "추력 유지" : "")
+    : L.shape === "fist" ? `추력 고정 ${Math.round(plane.throttle * 100)}%`
+    : L.shape === "v" ? "유지하면 기어 전환" : L.shape === "thumb" ? "유지하면 플랩 변경"
+    : `추력 ${Math.round(plane.throttle * 100)}%`;
+  const prog = (st, shapes) => st.present && shapes.includes(st.shape) && !st.fired ? Math.min(1, st.hold / HOLD_TRIGGER) : 0;
+  $("rBar").style.width = `${prog(R, ["v"]) * 100}%`;
+  $("lBar").style.width = `${prog(L, ["v", "thumb"]) * 100}%`;
+}
+
+addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.code.startsWith("Arrow")) e.preventDefault();
+  keys.add(e.code);
+  if (e.repeat) return;
+  startEngine();
+  if (e.code === "KeyG" && game.state === "flying") toggleGear();
+  if (e.code === "KeyF" && game.state === "flying") cycleFlaps();
+  if (e.code === "KeyC") toggleView();
+  if (e.code === "KeyP" || e.code === "Escape") togglePause();
+  if (e.code === "KeyR" && game.state !== "menu") startGame(game.mode);
+  if (e.code === "KeyH") $("guide").classList.toggle("hidden");
+});
+addEventListener("keyup", e => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+
+$("btnMission").addEventListener("click", () => startGame("mission"));
+$("btnFree").addEventListener("click", () => startGame("free"));
+$("btnGuide").addEventListener("click", () => $("guide").classList.toggle("hidden"));
+$("btnCal").addEventListener("click", () => {
+  if (!camOn) { toast("먼저 카메라를 켜 주세요", "warn"); return; }
+  CAL.pending = true;
+  hands.right.since = performance.now();
+  toast("오른손을 편하게 펴서 편한 위치에 들고 있어 주세요", "ok", 2500);
+});
+
+// ───────── 카메라 & HUD ─────────
+const camPos = new THREE.Vector3();
+function updateView(dt) {
+  const p = plane;
+  planeMesh.position.set(p.pos.x, p.pos.y + GEAR_H, p.pos.z);
+  planeMesh.rotation.set(p.theta, -p.psi, -p.phi, "YXZ");
+  planeMesh.userData.prop.rotation.z += dt * (game.state === "flying" ? 8 + p.throttle * 50 : 0);
+  planeMesh.userData.gear.visible = p.gear;
+  if (game.state !== "over") planeMesh.visible = view === "chase";
+
+  const fwd = new THREE.Vector3(Math.sin(p.psi), 0, -Math.cos(p.psi));
+  if (view === "chase") {
+    const want = planeMesh.position.clone().addScaledVector(fwd, -22).add(new THREE.Vector3(0, 6.5, 0));
+    if (camSnap) { camPos.copy(want); camSnap = false; }
+    camPos.lerp(want, 1 - Math.exp(-dt * 5));
+    camPos.y = Math.max(1.5, camPos.y);
+    camera.position.copy(camPos);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(planeMesh.position.clone().addScaledVector(fwd, 18).add(new THREE.Vector3(0, 2, 0)));
+  } else {
+    camera.position.copy(planeMesh.localToWorld(new THREE.Vector3(0, 0.9, -0.8)));
+    camera.quaternion.copy(planeMesh.quaternion);
+    camSnap = false;
+  }
+}
+
+const hud = $("hud"), hctx = hud.getContext("2d");
+let DPR = 1;
+function resize() {
+  DPR = Math.min(2, devicePixelRatio || 1);
+  renderer.setSize(innerWidth, innerHeight, false);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  hud.width = innerWidth * DPR; hud.height = innerHeight * DPR;
+}
+addEventListener("resize", resize);
+resize();
+
+function text(str, x, y, { size = 14, weight = 700, color = "#fff", align = "center" } = {}) {
+  const c = hctx;
+  c.font = `${weight} ${size}px -apple-system, "Apple SD Gothic Neo", sans-serif`;
+  c.textAlign = align;
+  c.lineWidth = 4; c.strokeStyle = "rgba(0,0,0,.55)"; c.strokeText(str, x, y);
+  c.fillStyle = color; c.fillText(str, x, y);
+}
+
+function drawAttitude(x, y, r) {
+  const c = hctx, p = plane, ppd = r / 25;
+  c.save();
+  c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.clip();
+  c.translate(x, y); c.rotate(-p.phi);
+  const off = p.theta * R2D * ppd;
+  c.fillStyle = "#3d7fd1"; c.fillRect(-2 * r, off - 3 * r, 4 * r, 3 * r);
+  c.fillStyle = "#8a5a2b"; c.fillRect(-2 * r, off, 4 * r, 3 * r);
+  c.strokeStyle = "#fff"; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(-2 * r, off); c.lineTo(2 * r, off); c.stroke();
+  c.lineWidth = 1.5;
+  for (const d of [-20, -10, 10, 20]) {
+    const yy = off - d * ppd, hw = Math.abs(d) === 10 ? 14 : 22;
+    c.beginPath(); c.moveTo(-hw, yy); c.lineTo(hw, yy); c.stroke();
+  }
+  c.restore();
+  c.strokeStyle = "#ff9f1c"; c.lineWidth = 3;
+  c.beginPath(); c.moveTo(x - 30, y); c.lineTo(x - 10, y); c.lineTo(x - 5, y + 6); c.moveTo(x + 30, y); c.lineTo(x + 10, y); c.lineTo(x + 5, y + 6); c.stroke();
+  c.fillStyle = "#ff9f1c"; c.beginPath(); c.arc(x, y, 2.5, 0, Math.PI * 2); c.fill();
+  c.strokeStyle = "rgba(255,255,255,.5)"; c.lineWidth = 2;
+  c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.stroke();
+}
+
+function drawTarget(w, h) {
+  if (game.mode !== "mission" || game.state !== "flying") return;
+  const done = game.ringIdx >= RINGS.length;
+  const target = done ? THRESHOLD : RINGS[game.ringIdx].c;
+  const label = done ? "활주로" : `링 ${game.ringIdx + 1}`;
+  const dist = Math.round(target.distanceTo(plane.pos));
+  const v = target.clone().project(camera);
+  const behind = v.z > 1;
+  let sx = (v.x + 1) / 2 * w, sy = (1 - v.y) / 2 * h;
+  if (behind) { sx = w - sx; sy = h - sy; }
+  const c = hctx;
+  if (!behind && sx > 40 && sx < w - 40 && sy > 90 && sy < h - 190) {
+    c.strokeStyle = "#ff9f1c"; c.lineWidth = 3;
+    const s = 16;
+    for (const [dx, dy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      c.beginPath(); c.moveTo(sx + dx * s, sy + dy * (s - 7)); c.lineTo(sx + dx * s, sy + dy * s); c.lineTo(sx + dx * (s - 7), sy + dy * s); c.stroke();
+    }
+    text(`${label} · ${dist} m`, sx, sy - 24, { size: 13, color: "#ffcf8a" });
+  } else {
+    const a = Math.atan2(sy - h / 2, sx - w / 2), rr = Math.min(w, h) * 0.3;
+    const ax = w / 2 + Math.cos(a) * rr, ay = h / 2 + Math.sin(a) * rr * 0.8;
+    c.save(); c.translate(ax, ay); c.rotate(a);
+    c.fillStyle = "#ff9f1c";
+    c.beginPath(); c.moveTo(18, 0); c.lineTo(-10, -12); c.lineTo(-4, 0); c.lineTo(-10, 12); c.closePath(); c.fill();
+    c.restore();
+    text(`${label} ${dist} m`, ax, ay + 30, { size: 13, color: "#ffcf8a" });
+  }
+}
+
+function missionText() {
+  const p = plane;
+  if (game.state === "menu") return ["", ""];
+  if (!p.hasFlown) {
+    const vr = Math.round(VS[p.flaps] * 1.05 * 1.944);
+    if (p.v * 1.944 >= vr) return ["지금! 오른손을 위로 올려 이륙하세요", `이륙 속도 ${vr} kt 도달`];
+    return ["왼손 🖐 을 위로 올려 추력을 높이세요", `이륙 속도 ${vr} kt 까지 가속`];
+  }
+  if (p.onGround && p.touchdown) return ["왼손을 내려 추력을 0으로 → 브레이크", "완전히 멈추면 착륙 완료"];
+  if (game.mode === "mission" && game.ringIdx < RINGS.length)
+    return [`링 ${game.ringIdx} / ${RINGS.length} 통과`, "주황색 링을 순서대로 통과하세요"];
+  const dist = Math.round(Math.hypot(p.pos.x - THRESHOLD.x, p.pos.z - THRESHOLD.z));
+  return ["활주로에 착륙하세요", `기어 DOWN · 플랩 2 · 활주로 끝까지 ${dist} m`];
+}
+
+function drawHUD(now) {
+  const w = innerWidth, h = innerHeight, c = hctx, p = plane;
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  c.clearRect(0, 0, w, h);
+  if (game.state === "menu") return;
+  drawTarget(w, h);
+
+  const [m1, m2] = missionText();
+  text(m1, w / 2, 92, { size: 20, weight: 800 });
+  text(m2, w / 2, 114, { size: 13, color: "#d7e3f4", weight: 600 });
+  const modeLabel = { hand: "🖐 손 조종 중", fist: "✊ 자동 수평", lost: "🛟 손 없음 → 자동 수평", key: "⌨️ 키보드 조종", idle: "⌨️ 키보드 (카메라 꺼짐)" }[ctl.mode];
+  text(modeLabel, w / 2, 140, { size: 13, color: ctl.mode === "lost" ? "#ffd23f" : "#9ff0c8" });
+
+  const blink = Math.floor(now / 250) % 2 === 0;
+  if (p.stall && blink) text("STALL · 기수를 내리고 추력을 올리세요", w / 2, h * 0.36, { size: 26, weight: 900, color: "#ff5a5f" });
+  else if (!p.onGround && p.pos.y < 60 && p.vs < -7 && blink) text("PULL UP", w / 2, h * 0.36, { size: 30, weight: 900, color: "#ff5a5f" });
+  else if (!p.onGround && !p.gear && p.pos.y < 80 && p.vs < -1 && blink) text("GEAR! 랜딩기어를 내리세요 (왼손 ✌️)", w / 2, h * 0.36, { size: 22, weight: 900, color: "#ffd23f" });
+
+  // 계기 묶음
+  const cx = w / 2, by = h - 88;
+  c.fillStyle = "rgba(10,15,25,.62)";
+  c.beginPath(); c.roundRect(cx - 300, by - 74, 600, 152, 14); c.fill();
+  drawAttitude(cx, by, 58);
+  const hdg = ((Math.round(p.psi * R2D) % 360) + 360) % 360;
+  text(`HDG ${String(hdg).padStart(3, "0")}°`, cx, by - 62, { size: 12, color: "#d7e3f4" });
+
+  const vsCol = VS[p.flaps] * 1.944;
+  const kt = p.v * 1.944;
+  text("속도", cx - 150, by - 32, { size: 12, color: "#93a3bd", weight: 600 });
+  text(`${Math.round(kt)}`, cx - 150, by + 4, { size: 32, weight: 800, color: !p.onGround && kt < vsCol * 1.15 ? "#ff5a5f" : "#fff" });
+  text("kt", cx - 150, by + 22, { size: 12, color: "#93a3bd" });
+  text(`실속 ${Math.round(vsCol)} kt`, cx - 150, by + 46, { size: 11, color: "#93a3bd", weight: 600 });
+
+  text("고도", cx + 150, by - 32, { size: 12, color: "#93a3bd", weight: 600 });
+  text(`${Math.round(p.pos.y * 3.281)}`, cx + 150, by + 4, { size: 32, weight: 800 });
+  text("ft", cx + 150, by + 22, { size: 12, color: "#93a3bd" });
+  const fpm = Math.round(p.vs * 196.85 / 50) * 50;
+  text(`${fpm > 0 ? "▲" : fpm < 0 ? "▼" : ""} ${Math.abs(fpm)} ft/min`, cx + 150, by + 46, { size: 11, color: fpm < -800 ? "#ff5a5f" : "#93a3bd", weight: 600 });
+
+  // 추력 막대
+  const tx = cx - 262, ty = by - 52, th = 104;
+  c.fillStyle = "rgba(255,255,255,.12)"; c.fillRect(tx - 8, ty, 16, th);
+  c.fillStyle = "#4ea8ff"; c.fillRect(tx - 8, ty + th * (1 - p.throttle), 16, th * p.throttle);
+  text(`추력`, tx, ty - 6, { size: 11, color: "#93a3bd", weight: 600 });
+  text(`${Math.round(p.throttle * 100)}%`, tx, ty + th + 18, { size: 13 });
+
+  // 기어 / 플랩
+  const gx = cx + 255;
+  text("기어", gx, by - 44, { size: 11, color: "#93a3bd", weight: 600 });
+  text(p.gear ? "▼ DOWN" : "▲ UP", gx, by - 24, { size: 14, color: p.gear ? "#3ddc97" : "#93a3bd" });
+  text("플랩", gx, by + 6, { size: 11, color: "#93a3bd", weight: 600 });
+  text(["0 · UP", "1 · 이륙", "2 · 착륙"][p.flaps], gx, by + 26, { size: 14, color: p.flaps ? "#ffd23f" : "#fff" });
+  if (game.mode === "mission") text(`⏱ ${game.t.toFixed(0)}s`, gx, by + 56, { size: 12, color: "#93a3bd" });
+}
+
+// ───────── 메인 루프 ─────────
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  processHands(now);
+  updateControls(dt);
+  if (game.state === "flying") {
+    game.t += dt;
+    prevPos.copy(plane.pos);
+    stepPlane(dt);
+    if (game.state === "flying") { checkRings(); checkStopped(); }
+    if (plane.stall && now - game.lastStallBeep > 450) { game.lastStallBeep = now; beep(1200, 0.12, "square", 0.08); }
+    if (Math.hypot(plane.pos.x, plane.pos.z) > 7000 && now - game.lastFarWarn > 6000) {
+      game.lastFarWarn = now;
+      toast("공항에서 너무 멀어졌어요. 돌아가세요!", "warn");
+    }
+  }
+  updateEffects(dt);
+  updateView(dt);
+  renderer.render(scene, camera);
+  drawHUD(now);
+  updateHandCards();
+  updateEngine();
+}
+showMenu();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

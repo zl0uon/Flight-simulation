@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>항공대 합격시켜주세요</title>
+<style>
+  :root {
+    --bg: #0e1420;
+    --panel: #172031;
+    --panel2: #1e2a3f;
+    --line: #2b3a55;
+    --text: #e8eef8;
+    --muted: #93a3bd;
+    --accent: #ff9f1c;
+    --ok: #3ddc97;
+    --warn: #ffd23f;
+    --bad: #ff5a5f;
+    --blue: #4ea8ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 20px; }
+  header h1 span { color: var(--accent); }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    padding: 9px 14px; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #1a1205; border-color: var(--accent); }
+  button.active { outline: 2px solid var(--accent); }
+  label.toggle { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+
+  main {
+    display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px 20px;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .panel h2 { margin: 0 0 10px; font-size: 14px; color: var(--muted); font-weight: 600; letter-spacing: .02em; }
+
+  .cam-wrap { position: relative; width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: 8px; overflow: hidden; }
+  .cam-wrap video, .cam-wrap canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1);
+  }
+  .cam-placeholder {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    color: var(--muted); font-size: 14px; padding: 20px; line-height: 1.6;
+  }
+  .recog { margin-top: 12px; }
+  .recog-name { font-size: 30px; font-weight: 800; min-height: 40px; }
+  .recog-hint { color: var(--muted); font-size: 13px; min-height: 18px; }
+  .hold-bar { height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .hold-bar div { height: 100%; width: 0; background: var(--accent); transition: width .08s linear; }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+  .stat { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .stat .v { font-size: 18px; font-weight: 700; margin-top: 2px; }
+
+  .sim-wrap { position: relative; width: 100%; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; }
+  .sim-wrap canvas { width: 100%; height: 100%; display: block; }
+  .overlay {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: rgba(10, 15, 25, .92); border: 1px solid var(--line); border-radius: 14px;
+    padding: 20px 26px; text-align: center; min-width: 300px; max-width: 90%;
+  }
+  .overlay h3 { margin: 0 0 8px; font-size: 22px; }
+  .overlay p { margin: 6px 0; color: var(--muted); line-height: 1.5; }
+  .overlay .big { font-size: 48px; font-weight: 800; color: var(--accent); margin: 6px 0; }
+  .overlay table { margin: 10px auto 0; border-collapse: collapse; font-size: 14px; }
+  .overlay td { padding: 3px 10px; text-align: left; }
+  .overlay td:last-child { text-align: right; font-weight: 700; }
+  .hidden { display: none !important; }
+
+  .toast {
+    position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+    padding: 10px 18px; border-radius: 10px; font-weight: 700; font-size: 15px;
+    background: var(--bad); color: #fff; box-shadow: 0 6px 20px rgba(0,0,0,.4);
+    transition: opacity .3s; opacity: 0; pointer-events: none; white-space: nowrap; max-width: 95%; overflow: hidden; text-overflow: ellipsis;
+  }
+  .toast.show { opacity: 1; }
+  .toast.ok { background: var(--ok); color: #062114; }
+  .toast.warn { background: var(--warn); color: #2a2100; }
+
+  .practice-fig svg { width: 140px; height: 170px; }
+  .timer { height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; margin-top: 10px; }
+  .timer div { height: 100%; background: var(--blue); width: 100%; }
+
+  .guide { padding: 0 20px 24px; }
+  @media (max-width: 900px) { .guide { padding: 0 16px 20px; } }
+  .cards { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+  @media (max-width: 1100px) { .cards { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 560px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; text-align: center;
+    transition: border-color .15s, transform .15s;
+  }
+  .card.lit { border-color: var(--accent); transform: translateY(-3px); }
+  .card svg { width: 90px; height: 110px; }
+  .card .name { font-weight: 800; font-size: 16px; }
+  .card .key { display: inline-block; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; margin-left: 4px; }
+  .card .desc { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.45; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>✈️ <span>항공대 합격시켜주세요</span> 훈련 시뮬레이터</h1>
+    <p>ICAO 표준 항공기 유도 수신호를 몸으로 익히는 AI 훈련 도구</p>
+  </div>
+  <div class="controls">
+    <button id="btnCam" class="primary">📷 카메라 켜기</button>
+    <button id="btnMission">🛬 유도 미션</button>
+    <button id="btnPractice">🎯 신호 연습</button>
+    <label class="toggle"><input type="checkbox" id="chkVoice" checked> 음성 안내</label>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>내 수신호 인식</h2>
+    <div class="cam-wrap">
+      <video id="video" playsinline muted></video>
+      <canvas id="poseCanvas"></canvas>
+      <div class="cam-placeholder" id="camPlaceholder">
+        카메라를 켜고 2m쯤 떨어져서<br>허리 위 상반신과 양팔이 모두 보이게 서 주세요.<br><br>
+        카메라가 없으면 키보드 1~6으로도 신호를 줄 수 있어요.
+      </div>
+    </div>
+    <div class="recog">
+      <div class="recog-name" id="recogName">—</div>
+      <div class="recog-hint" id="recogHint">신호를 0.5초 동안 유지하면 확정돼요</div>
+      <div class="hold-bar"><div id="holdBar"></div></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">현재 지시</div><div class="v" id="stCmd">—</div></div>
+      <div class="stat"><div class="k">지상 속도</div><div class="v" id="stSpeed">0 km/h</div></div>
+      <div class="stat"><div class="k">정지선까지</div><div class="v" id="stDist">—</div></div>
+      <div class="stat"><div class="k">경고</div><div class="v" id="stWarn">0</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2 id="simTitle">에이프런 (위에서 본 모습)</h2>
+    <div class="sim-wrap">
+      <canvas id="sim"></canvas>
+      <div class="toast" id="toast"></div>
+      <div class="overlay" id="overlay"></div>
+    </div>
+  </section>
+</main>
+
+<section class="guide">
+  <div class="panel">
+    <h2>수신호 가이드 (방향은 조종사 기준)</h2>
+    <div class="cards" id="cards"></div>
+    <p class="note">
+      ※ 발표 시연용으로 단순화했어요. 실제 ICAO 수신호는 손짓 동작(위아래로 흔들기 등)이 포함되지만, 이 프로그램은 팔의 <b>자세</b>를 기준으로 판별해요.
+      유도원은 조종사와 마주 보고 서기 때문에, 유도원이 <b>오른팔</b>을 뻗으면 조종사 기준 <b>좌회전</b>이에요.
+      실제 교육을 대체하지 않는 보조 훈련 도구예요.
+    </p>
+  </div>
+</section>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ───────── 수신호 정의 ─────────
+// fig: [유도원 오른팔, 왼팔] 각각 [위팔 각도, 아래팔 각도] (0=아래, 90=바깥 수평, 180=위)
+const SIGNALS = {
+  forward: { name: "직진", key: "1", fig: [[100, 170], [100, 170]],
+             desc: "양팔을 굽혀 손을 머리 높이로 들기 (앞으로 오라는 손짓)" },
+  left:    { name: "좌회전", key: "2", fig: [[90, 90], [100, 170]],
+             desc: "오른팔은 옆으로 수평, 왼팔은 머리 높이로 손짓" },
+  right:   { name: "우회전", key: "3", fig: [[100, 170], [90, 90]],
+             desc: "왼팔은 옆으로 수평, 오른팔은 머리 높이로 손짓" },
+  slow:    { name: "감속", key: "4", fig: [[40, 40], [40, 40]],
+             desc: "양팔을 아래로 45° 벌려 허리~무릎 높이에서 토닥이기" },
+  stop:    { name: "정지", key: "5", fig: [[160, 240], [160, 240]],
+             desc: "양팔을 머리 위로 올려 유도봉 교차" },
+  cut:     { name: "엔진 정지", key: "6", fig: [[10, 220], [5, 5]],
+             desc: "한 손을 목 앞으로 가져와 옆으로 긋기" },
+};
+const ORDER = ["forward", "left", "right", "slow", "stop", "cut"];
+
+function figureSVG(fig) {
+  const seg = 18;
+  const arm = (sx, sy, sign, [a1, a2]) => {
+    const r = d => d * Math.PI / 180;
+    const ex = sx + sign * Math.sin(r(a1)) * seg, ey = sy + Math.cos(r(a1)) * seg;
+    const hx = ex + sign * Math.sin(r(a2)) * seg, hy = ey + Math.cos(r(a2)) * seg;
+    const wx = hx + sign * Math.sin(r(a2)) * 11, wy = hy + Math.cos(r(a2)) * 11;
+    return `<polyline points="${sx},${sy} ${ex},${ey} ${hx},${hy}" fill="none" stroke="#e8eef8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+            <line x1="${hx}" y1="${hy}" x2="${wx}" y2="${wy}" stroke="#ff9f1c" stroke-width="4.5" stroke-linecap="round"/>`;
+  };
+  return `<svg viewBox="0 -10 100 130" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="50" cy="18" r="9" fill="none" stroke="#e8eef8" stroke-width="4"/>
+    <line x1="38" y1="35" x2="62" y2="35" stroke="#e8eef8" stroke-width="4" stroke-linecap="round"/>
+    <line x1="50" y1="35" x2="50" y2="75" stroke="#e8eef8" stroke-width="4" stroke-linecap="round"/>
+    <polyline points="40,112 44,75 56,75 60,112" fill="none" stroke="#e8eef8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    ${arm(38, 35, -1, fig[0])}
+    ${arm(62, 35, 1, fig[1])}
+  </svg>`;
+}
+
+const cardsEl = document.getElementById("cards");
+for (const id of ORDER) {
+  const s = SIGNALS[id];
+  cardsEl.insertAdjacentHTML("beforeend",
+    `<div class="card" data-id="${id}">${figureSVG(s.fig)}
+      <div class="name">${s.name}<span class="key">${s.key}</span></div>
+      <div class="desc">${s.desc}</div></div>`);
+}
+
+// ───────── 소리 ─────────
+let audioCtx = null;
+function beep(freq = 880, dur = 0.12, type = "sine") {
+  try {
+    audioCtx ??= new AudioContext();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch {}
+}
+function say(text) {
+  if (!document.getElementById("chkVoice").checked || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "ko-KR"; u.rate = 1.1;
+  speechSynthesis.speak(u);
+}
+
+const toastEl = document.getElementById("toast");
+let toastTimer = 0;
+function toast(text, kind = "bad", ms = 2200) {
+  toastEl.textContent = text;
+  toastEl.className = `toast show ${kind === "bad" ? "" : kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), ms);
+}
+
+const overlayEl = document.getElementById("overlay");
+function showOverlay(html) { overlayEl.innerHTML = html; overlayEl.classList.remove("hidden"); }
+function hideOverlay() { overlayEl.classList.add("hidden"); }
+
+// ───────── 자세 판별 ─────────
+const LM = { nose: 0, ls: 11, rs: 12, le: 13, re: 14, lw: 15, rw: 16, lh: 23, rh: 24 };
+const vis = p => p.visibility ?? 1;
+
+function classify(lm) {
+  if ([LM.ls, LM.rs, LM.le, LM.re, LM.lw, LM.rw].some(i => vis(lm[i]) < 0.5))
+    return { id: null, hint: "양팔과 어깨가 모두 화면에 보이게 서 주세요" };
+  const ls = lm[LM.ls], rs = lm[LM.rs], le = lm[LM.le], re = lm[LM.re];
+  const lw = lm[LM.lw], rw = lm[LM.rw], nose = lm[LM.nose];
+  const sw = Math.abs(ls.x - rs.x);
+  if (sw < 0.04) return { id: null, hint: "카메라를 정면으로 바라봐 주세요" };
+  const shY = (ls.y + rs.y) / 2, midX = (ls.x + rs.x) / 2;
+  const hipsOk = vis(lm[LM.lh]) > 0.5 && vis(lm[LM.rh]) > 0.5;
+  const torso = hipsOk ? Math.max(sw, (lm[LM.lh].y + lm[LM.rh].y) / 2 - shY) : sw * 1.5;
+
+  // 몸 바깥쪽으로 뻗은 거리 (어깨 기준)
+  const out = (s, w, other) => (w.x - s.x) * Math.sign(s.x - other.x);
+  const horiz = (s, e, w, other) =>
+    Math.abs(w.y - s.y) < 0.3 * torso && Math.abs(e.y - s.y) < 0.3 * torso && out(s, w, other) > 0.8 * sw;
+  const raised = (s, e, w) => w.y < s.y && w.y < e.y;
+
+  if (lw.y < nose.y && rw.y < nose.y && Math.abs(lw.x - rw.x) < 0.9 * sw) return { id: "stop" };
+  for (const [w, ow, os] of [[rw, lw, ls], [lw, rw, rs]]) {
+    if (Math.abs(w.x - midX) < 0.45 * sw && w.y > nose.y && w.y < shY + 0.35 * torso && ow.y > os.y + 0.1 * torso)
+      return { id: "cut" };
+  }
+  const rH = horiz(rs, re, rw, ls), lH = horiz(ls, le, lw, rs);
+  if (rH && lH) return { id: null, hint: "양팔을 모두 수평으로 뻗은 자세는 신호가 아니에요" };
+  // 유도원의 오른팔 수평 = 조종사 기준 좌회전
+  if (rH && raised(ls, le, lw)) return { id: "left" };
+  if (lH && raised(rs, re, rw)) return { id: "right" };
+  if (raised(ls, le, lw) && raised(rs, re, rw) && Math.abs(lw.x - rw.x) > 0.9 * sw) return { id: "forward" };
+  if (lw.y > shY + 0.75 * torso && rw.y > shY + 0.75 * torso && out(ls, lw, rs) > 0.35 * sw && out(rs, rw, ls) > 0.35 * sw)
+    return { id: "slow" };
+  return { id: null, hint: "" };
+}
+
+// ───────── 카메라 & MediaPipe ─────────
+const video = document.getElementById("video");
+const poseCanvas = document.getElementById("poseCanvas");
+const pctx = poseCanvas.getContext("2d");
+let landmarker = null, camOn = false, lastVideoTime = -1;
+
+async function loadLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = delegate => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate,
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+  try { return await PoseLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch { return await PoseLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+
+document.getElementById("btnCam").addEventListener("click", async e => {
+  if (camOn) return;
+  const btn = e.currentTarget;
+  const ph = document.getElementById("camPlaceholder");
+  btn.textContent = "⏳ 준비 중...";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    ph.textContent = "AI 모델을 불러오는 중...";
+    landmarker = await loadLandmarker();
+    poseCanvas.width = video.videoWidth;
+    poseCanvas.height = video.videoHeight;
+    ph.classList.add("hidden");
+    camOn = true;
+    btn.textContent = "📷 카메라 켜짐";
+    btn.classList.remove("primary");
+  } catch (err) {
+    console.error(err);
+    ph.innerHTML = "카메라를 켤 수 없어요.<br>권한을 허용했는지, localhost로 열었는지 확인해 주세요.<br><br>키보드 1~6으로도 신호를 줄 수 있어요.";
+    btn.textContent = "📷 다시 시도";
+  }
+});
+
+const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24]];
+function drawPose(lm, active) {
+  pctx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+  if (!lm) return;
+  const W = poseCanvas.width, H = poseCanvas.height;
+  pctx.lineWidth = 5; pctx.lineCap = "round";
+  pctx.strokeStyle = active ? "#ff9f1c" : "rgba(78,168,255,.9)";
+  for (const [a, b] of BONES) {
+    if (vis(lm[a]) < 0.4 || vis(lm[b]) < 0.4) continue;
+    pctx.beginPath(); pctx.moveTo(lm[a].x * W, lm[a].y * H); pctx.lineTo(lm[b].x * W, lm[b].y * H); pctx.stroke();
+  }
+  for (const i of [15, 16]) {
+    if (vis(lm[i]) < 0.4) continue;
+    pctx.fillStyle = "#ffd23f";
+    pctx.beginPath(); pctx.arc(lm[i].x * W, lm[i].y * H, 9, 0, Math.PI * 2); pctx.fill();
+  }
+}
+
+// ───────── 신호 확정 (0.5초 유지) ─────────
+const HOLD = 0.5;
+let cand = null, candT = 0, confirmed = null, noneT = 0;
+const recogName = document.getElementById("recogName");
+const recogHint = document.getElementById("recogHint");
+const holdBar = document.getElementById("holdBar");
+
+function updateRecognition(res, dt) {
+  const id = res.id;
+  if (id === cand) candT += dt; else { cand = id; candT = 0; }
+  if (id) {
+    noneT = 0;
+    holdBar.style.width = `${Math.min(1, candT / HOLD) * 100}%`;
+    if (candT >= HOLD && confirmed !== id) { confirmed = id; onSignal(id); }
+  } else {
+    holdBar.style.width = "0";
+    noneT += dt;
+    if (noneT > 0.6) confirmed = null;
+  }
+  const shown = confirmed ?? id;
+  recogName.textContent = shown ? SIGNALS[shown].name : "—";
+  recogName.style.color = confirmed ? "var(--accent)" : "var(--text)";
+  recogHint.textContent = res.hint ?? (confirmed ? "신호 확정!" : "신호를 0.5초 동안 유지하면 확정돼요");
+  highlightCard(shown);
+}
+
+function highlightCard(id) {
+  for (const c of cardsEl.children) c.classList.toggle("lit", c.dataset.id === id);
+}
+
+// 카메라가 없을 때를 위한 키보드 입력
+window.addEventListener("keydown", e => {
+  const id = ORDER.find(k => SIGNALS[k].key === e.key);
+  if (!id) return;
+  recogName.textContent = SIGNALS[id].name;
+  recogName.style.color = "var(--accent)";
+  recogHint.textContent = "키보드 입력";
+  highlightCard(id);
+  onSignal(id);
+});
+
+function onSignal(id) {
+  beep(id === "stop" || id === "cut" ? 520 : 880);
+  if (mode === "mission") mission.command(id);
+  else if (mode === "practice") practice.check(id);
+}
+
+// ───────── 시뮬레이션 ─────────
+const W = 960, H = 600;
+const PX_TO_M = 37.6 / 80;      // A320 길이 37.6m = 80px
+const KMH = 0.625;              // 화면 속도 → 표시 속도(km/h)
+const LEAD_X = 600, STOP_Y = 150, TERMINAL_Y = 95, TAXI_Y = 470, TURN_R = 70;
+const OBSTACLES = [
+  { x: 666, y: 262, w: 30, h: 18, color: "#e8c547", label: "토잉카" },
+  { x: 488, y: 300, w: 36, h: 16, color: "#4ea8ff", label: "수하물 카트" },
+  { x: 342, y: 150, w: 76, h: 80, plane: true },
+  { x: 782, y: 150, w: 76, h: 80, plane: true },
+];
+const CMDS = {
+  forward: { v: 40, turn: 0 },
+  left: { v: 18, turn: -1 },
+  right: { v: 18, turn: 1 },
+  slow: { v: 12, turn: 0 },
+  stop: { v: 0, turn: 0 },
+};
+
+const sim = document.getElementById("sim");
+const ctx = sim.getContext("2d");
+function resizeSim() {
+  const dpr = window.devicePixelRatio || 1;
+  sim.width = W * dpr; sim.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resizeSim();
+
+function toWorld(p, lx, ly) {
+  const c = Math.cos(p.th), s = Math.sin(p.th);
+  return { x: p.x + lx * c - ly * s, y: p.y + lx * s + ly * c };
+}
+
+let mode = "idle";
+
+const mission = {
+  reset() {
+    this.p = { x: 110, y: TAXI_Y, th: Math.PI / 2, v: 0 };
+    this.cmd = null;
+    this.state = "running";
+    this.warnings = [];
+    this.t = 0;
+    this.zoneWarned = false;
+    this.parkedSaid = false;
+  },
+  warn(text) {
+    this.warnings.push(text);
+    toast(`⚠️ ${text}`, "warn", 2600);
+    beep(300, 0.25, "square");
+    say(text);
+  },
+  nose() { return toWorld(this.p, 0, -40); },
+  command(id) {
+    if (this.state !== "running" && this.state !== "parked") return;
+    if (id === "cut") {
+      if (this.p.v > 0.5) { this.warn("이동 중에는 엔진 정지 신호를 줄 수 없어요. 먼저 정지!"); return; }
+      this.finish();
+      return;
+    }
+    const n = this.nose();
+    if (id === "forward" && Math.abs(n.x - LEAD_X) < 60 && n.y - STOP_Y < 70 && n.y > STOP_Y - 20)
+      this.warn("정지선이 가까워요. 직진 대신 감속이나 정지 신호를 주세요");
+    this.cmd = id;
+    if (id !== "stop") { this.state = "running"; this.parkedSaid = false; }
+  },
+  update(dt) {
+    if (this.state !== "running" && this.state !== "parked") return;
+    this.t += dt;
+    const p = this.p, c = CMDS[this.cmd] ?? { v: 0, turn: 0 };
+    const acc = c.v > p.v ? 14 : 28;
+    p.v += Math.sign(c.v - p.v) * Math.min(Math.abs(c.v - p.v), acc * dt);
+    p.th += c.turn * (p.v / TURN_R) * dt;
+    p.x += Math.sin(p.th) * p.v * dt;
+    p.y -= Math.cos(p.th) * p.v * dt;
+
+    const n = this.nose();
+    // 정지선 접근 속도 경고
+    const inZone = Math.abs(n.x - LEAD_X) < 60 && n.y - STOP_Y < 90 && n.y > STOP_Y;
+    if (inZone && p.v > 20 && !this.zoneWarned) { this.zoneWarned = true; this.warn("너무 빨라요! 감속 신호를 주세요"); }
+    if (!inZone) this.zoneWarned = false;
+
+    // 충돌 검사: 기수, 꼬리, 날개 끝, 수평꼬리날개
+    const pts = [[0, -40], [0, 40], [-38, 10], [38, 10], [-20, 4], [20, 4], [-16, 38], [16, 38]].map(([x, y]) => toWorld(p, x, y));
+    for (const q of pts) {
+      if (q.x < 0 || q.x > W || q.y > H) return this.fail("항공기가 유도로를 벗어났어요");
+      if (q.y < TERMINAL_Y) return this.fail("터미널과 충돌했어요");
+      for (const o of OBSTACLES)
+        if (q.x > o.x && q.x < o.x + o.w && q.y > o.y && q.y < o.y + o.h)
+          return this.fail(`${o.plane ? "옆 게이트 항공기" : o.label}와(과) 충돌했어요`);
+    }
+
+    if (this.cmd === "stop" && p.v < 0.5) {
+      this.state = "parked";
+      if (!this.parkedSaid) { this.parkedSaid = true; toast("정지 완료. 위치가 맞으면 엔진 정지 신호를!", "ok", 3000); say("정지 완료. 엔진 정지 신호를 주세요"); }
+    }
+  },
+  fail(reason) {
+    this.state = "failed";
+    beep(180, 0.5, "sawtooth");
+    say(reason);
+    showOverlay(`<h3>💥 미션 실패</h3><p>${reason}</p><p>실제 공항이었다면 큰 사고로 이어질 수 있어요.</p>
+      <button id="retry" class="primary" style="margin-top:10px">다시 하기</button>`);
+    document.getElementById("retry").onclick = startMission;
+  },
+  finish() {
+    this.state = "done";
+    const p = this.p, n = this.nose();
+    const along = (n.y - STOP_Y) * PX_TO_M;       // +: 정지선 앞, -: 초과
+    const lat = (n.x - LEAD_X) * PX_TO_M;
+    let hdg = ((p.th % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI) - Math.PI;
+    hdg = hdg * 180 / Math.PI;
+    const pAlong = Math.min(40, Math.abs(along) * 8);
+    const pLat = Math.min(25, Math.abs(lat) * 10);
+    const pHdg = Math.min(15, Math.abs(hdg) * 1.5);
+    const pWarn = this.warnings.length * 5;
+    const score = Math.max(0, Math.round(100 - pAlong - pLat - pHdg - pWarn));
+    const grade = score >= 90 ? "S" : score >= 75 ? "A" : score >= 55 ? "B" : "C";
+    beep(1046, 0.15); setTimeout(() => beep(1318, 0.25), 150);
+    say(`유도 완료. ${score}점`);
+    showOverlay(`<h3>✅ 유도 완료!</h3>
+      <div class="big">${score}점 · ${grade}</div>
+      <table>
+        <tr><td>정지 위치 오차</td><td>${Math.abs(along).toFixed(1)} m ${along < 0 ? "(초과)" : "(미달)"}</td></tr>
+        <tr><td>중심선 이탈</td><td>${Math.abs(lat).toFixed(1)} m</td></tr>
+        <tr><td>기수 방향 오차</td><td>${Math.abs(hdg).toFixed(1)}°</td></tr>
+        <tr><td>안전 경고</td><td>${this.warnings.length}회</td></tr>
+        <tr><td>소요 시간</td><td>${this.t.toFixed(1)}초</td></tr>
+      </table>
+      <button id="retry" class="primary" style="margin-top:14px">다시 하기</button>`);
+    document.getElementById("retry").onclick = startMission;
+  },
+};
+
+function startMission() {
+  mode = "mission";
+  mission.reset();
+  hideOverlay();
+  setModeButtons();
+  document.getElementById("simTitle").textContent = "유도 미션: 항공기를 12번 게이트에 세우세요";
+  toast("직진 → 좌회전으로 유도선에 진입 → 감속 → 정지 → 엔진 정지", "ok", 4000);
+  say("항공기를 십이번 게이트로 유도하세요");
+}
+
+// ───────── 신호 연습 모드 ─────────
+const PRACTICE_TIME = 8;
+const practice = {
+  start() {
+    this.list = [...ORDER].sort(() => Math.random() - 0.5);
+    this.idx = 0; this.results = []; this.wrong = 0;
+    this.next();
+  },
+  next() {
+    if (this.idx >= this.list.length) return this.end();
+    this.target = this.list[this.idx];
+    this.left = PRACTICE_TIME;
+    this.locked = false;
+    const s = SIGNALS[this.target];
+    showOverlay(`<p>${this.idx + 1} / ${this.list.length}</p>
+      <h3>이 신호를 해 보세요</h3>
+      <div class="big">${s.name}</div>
+      <div class="practice-fig">${figureSVG(s.fig)}</div>
+      <p>${s.desc}</p>
+      <div class="timer"><div id="ptimer"></div></div>`);
+    say(s.name);
+  },
+  check(id) {
+    if (this.locked || !this.target) return;
+    if (id === this.target) {
+      this.locked = true;
+      this.results.push({ id, ok: true, time: PRACTICE_TIME - this.left });
+      toast(`⭕ 정답! ${(PRACTICE_TIME - this.left).toFixed(1)}초`, "ok", 1200);
+      this.idx++; setTimeout(() => mode === "practice" && this.next(), 1000);
+    } else {
+      this.wrong++;
+      toast(`❌ ${SIGNALS[id].name} 신호예요. 다시!`, "bad", 1200);
+    }
+  },
+  update(dt) {
+    if (this.locked || !this.target) return;
+    this.left -= dt;
+    const bar = document.getElementById("ptimer");
+    if (bar) bar.style.width = `${Math.max(0, this.left / PRACTICE_TIME) * 100}%`;
+    if (this.left <= 0) {
+      this.locked = true;
+      this.results.push({ id: this.target, ok: false });
+      toast(`⏰ 시간 초과: ${SIGNALS[this.target].name}`, "warn", 1200);
+      this.idx++; setTimeout(() => mode === "practice" && this.next(), 1000);
+    }
+  },
+  end() {
+    this.target = null;
+    const ok = this.results.filter(r => r.ok);
+    const acc = Math.round(ok.length / this.results.length * 100);
+    const avg = ok.length ? ok.reduce((a, r) => a + r.time, 0) / ok.length : 0;
+    say(`연습 종료. 정확도 ${acc}퍼센트`);
+    showOverlay(`<h3>🎯 연습 결과</h3>
+      <div class="big">${acc}%</div>
+      <table>
+        ${this.results.map(r => `<tr><td>${SIGNALS[r.id].name}</td><td>${r.ok ? `⭕ ${r.time.toFixed(1)}초` : "❌"}</td></tr>`).join("")}
+        <tr><td>평균 반응 시간</td><td>${avg.toFixed(1)}초</td></tr>
+        <tr><td>잘못된 신호</td><td>${this.wrong}회</td></tr>
+      </table>
+      <button id="retry" class="primary" style="margin-top:14px">다시 하기</button>`);
+    document.getElementById("retry").onclick = startPractice;
+  },
+};
+
+function startPractice() {
+  mode = "practice";
+  setModeButtons();
+  document.getElementById("simTitle").textContent = "신호 연습: 화면에 나온 수신호를 따라 하세요";
+  practice.start();
+}
+
+function setModeButtons() {
+  document.getElementById("btnMission").classList.toggle("active", mode === "mission");
+  document.getElementById("btnPractice").classList.toggle("active", mode === "practice");
+}
+document.getElementById("btnMission").addEventListener("click", startMission);
+document.getElementById("btnPractice").addEventListener("click", startPractice);
+
+// ───────── 그리기 ─────────
+function drawPlane(p, body = "#f4f6fa", stroke = "#1b2433") {
+  ctx.save();
+  ctx.translate(p.x, p.y); ctx.rotate(p.th);
+  ctx.fillStyle = body; ctx.strokeStyle = stroke; ctx.lineWidth = 1.5;
+  const poly = pts => { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.fill(); ctx.stroke(); };
+  poly([[-5, -6], [-38, 8], [-38, 13], [-5, 7]]);
+  poly([[5, -6], [38, 8], [38, 13], [5, 7]]);
+  poly([[-4, 30], [-16, 37], [-16, 41], [-4, 38]]);
+  poly([[4, 30], [16, 37], [16, 41], [4, 38]]);
+  ctx.fillStyle = "#9aa6b8";
+  ctx.fillRect(-22, -2, 5, 11); ctx.fillRect(17, -2, 5, 11);
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.moveTo(0, -40); ctx.quadraticCurveTo(6, -36, 6, -26); ctx.lineTo(6, 34);
+  ctx.quadraticCurveTo(3, 41, 0, 42); ctx.quadraticCurveTo(-3, 41, -6, 34); ctx.lineTo(-6, -26);
+  ctx.quadraticCurveTo(-6, -36, 0, -40); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#26324a";
+  ctx.fillRect(-3.5, -35, 7, 3);
+  ctx.restore();
+}
+
+function drawScene() {
+  ctx.fillStyle = "#353d4c"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#2f6b3f"; ctx.fillRect(0, 530, W, 70);
+
+  // 유도로
+  ctx.strokeStyle = "#f5c518"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, TAXI_Y); ctx.lineTo(W, TAXI_Y); ctx.stroke();
+  ctx.fillStyle = "#c9ced8"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText("TAXIWAY A", 14, TAXI_Y + 24);
+
+  // 12번 게이트 유도선
+  ctx.beginPath(); ctx.arc(LEAD_X - TURN_R, TAXI_Y - TURN_R, TURN_R, 0, Math.PI / 2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(LEAD_X, TAXI_Y - TURN_R); ctx.lineTo(LEAD_X, STOP_Y); ctx.stroke();
+  ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(LEAD_X - 16, STOP_Y); ctx.lineTo(LEAD_X + 16, STOP_Y); ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 11px sans-serif"; ctx.fillText("STOP", LEAD_X + 20, STOP_Y + 4);
+
+  // 옆 게이트 유도선
+  ctx.strokeStyle = "rgba(245,197,24,.45)"; ctx.lineWidth = 2;
+  for (const gx of [380, 820]) { ctx.beginPath(); ctx.moveTo(gx, STOP_Y); ctx.lineTo(gx, 260); ctx.stroke(); }
+
+  // 터미널
+  ctx.fillStyle = "#5a6478"; ctx.fillRect(0, 0, W, TERMINAL_Y);
+  ctx.fillStyle = "#86b6e8";
+  for (let x = 20; x < W; x += 40) ctx.fillRect(x, 60, 24, 10);
+  ctx.fillStyle = "#e8eef8"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText("TERMINAL", 20, 32);
+  for (const [gx, n] of [[380, 11], [600, 12], [820, 13]]) {
+    ctx.fillStyle = "#e8eef8"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`GATE ${n}`, gx - 26, 52);
+    ctx.fillStyle = "#7d879a"; ctx.fillRect(gx - 52, TERMINAL_Y, 14, 38);
+  }
+
+  // 장애물
+  for (const o of OBSTACLES) {
+    if (o.plane) { drawPlane({ x: o.x + o.w / 2, y: o.y + 40, th: 0 }, "#aab3c2", "#4a5568"); continue; }
+    ctx.fillStyle = o.color; ctx.fillRect(o.x, o.y, o.w, o.h);
+    ctx.strokeStyle = "#111"; ctx.lineWidth = 1; ctx.strokeRect(o.x, o.y, o.w, o.h);
+    ctx.fillStyle = "#c9ced8"; ctx.font = "11px sans-serif"; ctx.fillText(o.label, o.x - 4, o.y - 5);
+  }
+
+  // 유도원 (나)
+  const mx = LEAD_X, my = 122;
+  ctx.fillStyle = "#ff9f1c"; ctx.beginPath(); ctx.arc(mx, my, 6, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#ff5a1c"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(mx - 6, my); ctx.lineTo(mx - 14, my - 6); ctx.moveTo(mx + 6, my); ctx.lineTo(mx + 14, my - 6); ctx.stroke();
+  ctx.fillStyle = "#ffcf8a"; ctx.font = "bold 11px sans-serif"; ctx.fillText("나(유도원)", mx + 16, my + 4);
+}
+
+function drawMission() {
+  const m = mission;
+  if (!m.p) return;
+  drawPlane(m.p);
+  // 접근 중 남은 거리 표시
+  const n = m.nose();
+  if (Math.abs(n.x - LEAD_X) < 60 && n.y < TAXI_Y - 40 && m.state !== "failed") {
+    const d = (n.y - STOP_Y) * PX_TO_M;
+    ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(LEAD_X + 70, 6, 92, 40);
+    ctx.fillStyle = d < 0 ? "#ff5a5f" : d < 5 ? "#ffd23f" : "#3ddc97";
+    ctx.font = "bold 20px monospace";
+    ctx.fillText(d < 0 ? "STOP!" : `${d.toFixed(1)}m`, LEAD_X + 78, 34);
+  }
+}
+
+function updateStats() {
+  const m = mission;
+  const inMission = mode === "mission" && m.p;
+  document.getElementById("stCmd").textContent = inMission && m.cmd ? SIGNALS[m.cmd].name : "—";
+  document.getElementById("stSpeed").textContent = inMission ? `${(m.p.v * KMH).toFixed(0)} km/h` : "0 km/h";
+  document.getElementById("stWarn").textContent = inMission ? m.warnings.length : "0";
+  if (inMission) {
+    const n = m.nose();
+    const onLead = Math.abs(n.x - LEAD_X) < 60 && n.y < TAXI_Y - 40;
+    document.getElementById("stDist").textContent = onLead ? `${((n.y - STOP_Y) * PX_TO_M).toFixed(1)} m` : "진입 전";
+  } else document.getElementById("stDist").textContent = "—";
+}
+
+// ───────── 메인 루프 ─────────
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  if (camOn && landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, now);
+    const lm = result.landmarks?.[0];
+    const res = lm ? classify(lm) : { id: null, hint: "사람이 보이지 않아요" };
+    drawPose(lm, !!res.id);
+    updateRecognition(res, dt);
+  }
+
+  if (mode === "mission") mission.update(dt);
+  if (mode === "practice") practice.update(dt);
+
+  drawScene();
+  if (mode === "mission") drawMission();
+  updateStats();
+  requestAnimationFrame(loop);
+}
+
+showOverlay(`<h3>✈️ 마샬링 훈련 시뮬레이터</h3>
+  <p>지상 유도원이 되어 수신호로 항공기를 게이트까지 안내하세요.</p>
+  <p><b>🎯 신호 연습</b>: 수신호 6가지를 익혀요<br><b>🛬 유도 미션</b>: 실제로 항공기를 주기장에 세워요</p>
+  <div style="display:flex;gap:8px;justify-content:center;margin-top:12px">
+    <button class="primary" id="introPractice">신호 연습부터</button>
+    <button id="introMission">바로 미션</button>
+  </div>`);
+document.getElementById("introPractice").onclick = startPractice;
+document.getElementById("introMission").onclick = startMission;
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

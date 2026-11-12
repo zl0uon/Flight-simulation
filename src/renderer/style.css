@@ -1,0 +1,111 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #111;
+  color: #eee;
+  font: 13px -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+#view {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+#video, #canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#video { transform: scaleX(-1); /* 거울 모드 */ }
+
+#fps {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  font: 600 12px ui-monospace, Menlo, monospace;
+}
+#fps.slow { color: #ffab40; }
+
+#bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+}
+
+#state { font-size: 15px; font-weight: 600; }
+
+#pause {
+  background: #333;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+#warn {
+  margin: 0 12px;
+  padding: 8px;
+  background: #4a2a00;
+  border-radius: 6px;
+  line-height: 1.5;
+}
+
+button {
+  background: #333;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+#main { display: flex; height: 100%; }
+#left { width: 400px; flex: none; }
+#who { padding: 0 12px; color: #9e9e9e; }
+
+#side {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-left: 1px solid #333;
+  user-select: text;
+}
+#side table { width: 100%; border-collapse: collapse; font: 11px ui-monospace, Menlo, monospace; }
+#side th, #side td { padding: 1px 4px; text-align: right; }
+#side th:nth-child(-n+2), #side td:nth-child(-n+2) { text-align: left; }
+#side thead th { color: #9e9e9e; border-bottom: 1px solid #333; }
+#save { margin-top: 8px; }
+
+/* PiP 소스 영상은 화면에 보일 필요가 없지만 display:none 이면 PiP 가 안 될 수 있어 투명하게만 */
+#pip-video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+#setup {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  background: #111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#setup form { display: grid; gap: 10px; width: 260px; }
+#setup h1 { margin: 0; font-size: 17px; }
+#setup label { display: grid; gap: 4px; }
+#setup input { font: inherit; padding: 5px 8px; user-select: text; }
+#setup fieldset { border: 1px solid #333; border-radius: 6px; display: flex; gap: 16px; }
+#setup fieldset label { display: flex; gap: 4px; align-items: center; }
