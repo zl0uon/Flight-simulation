@@ -1,0 +1,18 @@
+participant_id,session_id,mode,scenario,trial_no,start_time,reaction_time_s,target_time_s,path_error_m,outcome,fail_reason,landing_success,touchdown_sink_ms,touchdown_speed_ms,touchdown_offset_m,hand_lost_pct
+P001,20261122-204151,gesture,takeoff,1,2026-11-22T20:42:00.841,1.129,16.464,23.6,success,,,,,,0.0
+P001,20261122-204151,gesture,straight,2,2026-11-22T20:42:22.768,0.27,30.398,31.54,success,,,,,,0.0
+P001,20261122-204151,gesture,turn,3,2026-11-22T20:42:57.966,1.133,27.533,107.01,success,,,,,,10.9
+P001,20261122-204151,gesture,landing,4,2026-11-22T20:43:30.032,40.866,,17.98,aborted,user quit,False,,,,20.4
+P001,20261122-205314,gesture,takeoff,5,2026-11-22T20:53:19.835,5.153,16.415,21.81,success,,,,,,0.0
+P001,20261122-205314,gesture,straight,6,2026-11-22T20:53:40.786,28.865,30.055,13.95,success,,,,,,0.0
+P001,20261122-205314,gesture,turn,7,2026-11-22T20:54:16.654,0.265,26.464,64.48,success,,,,,,0.0
+P001,20261122-205314,gesture,landing,8,2026-11-22T20:54:48.714,0.202,,386.64,aborted,user quit,False,,,,2.8
+P001,20261122-210650,gesture,takeoff,9,2026-11-22T21:06:55.405,6.14,16.408,4.46,success,,,,,,3.7
+P001,20261122-210650,gesture,straight,10,2026-11-22T21:07:17.807,10.136,30.07,7.65,success,,,,,,0.0
+P001,20261122-210650,gesture,turn,11,2026-11-22T21:07:53.407,1.402,25.2,63.33,success,,,,,,0.0
+P001,20261122-210650,gesture,landing,12,2026-11-22T21:08:23.607,14.542,,75.87,aborted,user quit,False,,,,36.3
+P001,20261122-213215,gesture,takeoff,13,2026-11-22T21:32:20.859,0.073,16.399,5.34,success,,,,,,0.0
+P001,20261122-213629,gesture,takeoff,14,2026-11-22T21:36:36.776,10.2,16.402,8.69,success,,,,,,0.0
+P001,20261122-213629,gesture,straight,15,2026-11-22T21:36:57.675,14.871,30.404,48.27,success,,,,,,0.0
+P001,20261122-213629,gesture,turn,16,2026-11-22T21:37:32.310,0.201,25.839,38.59,success,,,,,,0.0
+P001,20261122-213629,gesture,landing,17,2026-11-22T21:38:03.990,4.401,,41.08,aborted,user quit,False,,,,96.9

@@ -1,0 +1,1062 @@
+"""3D 추적 화면과 시점 조작.
+
+기체 뒤에서 따라가는 카메라로 지면·활주로·건물·기체를 원근 투영해 그린다.
+별도 3D 라이브러리 없이 OpenCV + NumPy만 쓴다.
+- 지면과 공항: 위에서 본 질감을 호모그래피로 지면에 깐다 (cv2.warpPerspective).
+- 기체와 건물: 다각형을 먼 것부터 칠한다 (화가 알고리즘) + 단순 음영.
+- 목표 경로는 지면 위 마젠타색 띠, 기체 아래에는 그림자와 수직선(지면 위치 표시).
+
+시점 조작 (View)
+    N 또는 화면 위 DAY/NIGHT 버튼 클릭   낮 <-> 밤 전환
+    W 또는 그 옆 날씨 버튼 클릭         날씨 전환 (맑음 -> 흐림 -> 비 -> 뇌우 -> 안개 -> 눈)
+    마우스 왼쪽 드래그      카메라 회전 (좌우 = 둘레, 상하 = 높이)
+    트랙패드 두 손가락 스크롤 (또는 마우스 휠)   카메라 회전
+    Ctrl 또는 Option + 스크롤, + / -            확대 / 축소
+    방향키 또는 4 6 8 2     카메라 회전
+    1 뒤 / 3 옆 / 7 위 / 9 앞   미리 정한 시점
+    5 또는 0, 오른쪽 클릭   기본 시점으로
+    V                       3D <-> 2D 지도 전환
+
+표시만 담당한다. 비행 모델과 기록되는 측정값에는 영향을 주지 않는다.
+"""
+
+import math
+import sys
+
+import cv2
+import numpy as np
+
+import cockpit as ck
+import scenery
+from cockpit import AA, CANVAS_H, CYAN, MAGENTA, MAP_W, WHITE
+
+W, H = MAP_W, CANVAS_H
+FOCAL = (W / 2) / math.tan(math.radians(30))   # 수평 화각 60도
+CX, CY = W / 2, H * 0.56                        # 기체가 화면 중앙보다 조금 아래에 오도록
+NEAR = 4.0                                      # 이보다 가까운(또는 뒤쪽) 부분은 잘라낸다 (m)
+GEAR_HEIGHT = 4.2                               # 바퀴가 지면에 닿을 때 기체 중심 높이 (m)
+
+HAZE = np.array([228, 208, 184], np.float32)    # 지평선 근처 하늘색 (BGR)
+ZENITH = np.array([190, 112, 44], np.float32)   # 높은 하늘색
+SUN = np.array([0.35, 0.25, 0.9]) / np.linalg.norm([0.35, 0.25, 0.9])   # 빛이 오는 방향
+
+
+# ---------------------------------------------------------------- 시점 상태
+
+TIME_BUTTON = (296, 10, 420, 42)   # 화면 위 가운데의 낮/밤 전환 버튼 (x1, y1, x2, y2)
+WEATHER_BUTTON = (428, 10, 566, 42)   # 그 옆의 날씨 전환 버튼
+
+# 날씨별 화면 설정 (표시 전용. 바람·난기류는 --env 로 따로 정한다)
+#   fog    멀리 흐려지는 거리 척도 (m): 작을수록 시야가 나쁘다
+#   dim    지면·기체·건물의 밝기 배율 (흐리면 어둡다)
+#   cover  구름 양 0~1,  cloud = 구름 색,  base = 구름 밑면 높이 (m)
+#   sky    낮 하늘의 (지평선 색, 높은 하늘 색). None이면 맑은 하늘
+#   sun    해·달·별이 보이는지
+#   rain / snow  빗줄기·눈송이 수,  lightning  번개
+WEATHERS = {
+    "clear":  dict(label="CLEAR", fog=4500.0, dim=1.0, cover=0.22, cloud=(252, 250, 246), base=520.0,
+                   sky=None, sun=True, rain=0, snow=0, lightning=False),
+    "cloudy": dict(label="CLOUDY", fog=3600.0, dim=0.84, cover=0.75, cloud=(226, 224, 220), base=460.0,
+                   sky=((214, 204, 192), (196, 160, 118)), sun=True, rain=0, snow=0, lightning=False),
+    "rain":   dict(label="RAIN", fog=1900.0, dim=0.66, cover=1.0, cloud=(150, 148, 146), base=380.0,
+                   sky=((168, 164, 158), (128, 124, 118)), sun=False, rain=260, snow=0, lightning=False),
+    "storm":  dict(label="STORM", fog=1300.0, dim=0.5, cover=1.0, cloud=(92, 90, 90), base=340.0,
+                   sky=((118, 114, 110), (70, 68, 66)), sun=False, rain=520, snow=0, lightning=True),
+    "fog":    dict(label="FOG", fog=520.0, dim=0.9, cover=0.0, cloud=(210, 210, 210), base=400.0,
+                   sky=((206, 206, 204), (190, 190, 188)), sun=False, rain=0, snow=0, lightning=False),
+    "snow":   dict(label="SNOW", fog=1500.0, dim=0.95, cover=1.0, cloud=(200, 200, 202), base=400.0,
+                   sky=((212, 212, 212), (176, 176, 178)), sun=False, rain=0, snow=420, lightning=False),
+}
+_wx = WEATHERS["clear"]   # 지금 그리고 있는 프레임의 날씨 (draw_scene이 정한다)
+
+# 한글 입력 상태에서 누른 키: 같은 자리의 영문 키로 바꿔 준다 (n = ㅜ, v = ㅍ, r = ㄱ, q = ㅂ, w = ㅈ)
+HANGUL_KEYS = {0x315C: ord("n"), 0x314D: ord("v"), 0x3131: ord("r"), 0x3142: ord("q"),
+               0x3148: ord("w")}
+
+
+def normalize_key(key: int) -> int:
+    return HANGUL_KEYS.get(key, key)
+
+
+class View:
+    """카메라 시점. az = 기체 진행 방향 기준 둘레 각(0 = 바로 뒤), el = 올려다본 높이 각."""
+
+    DEFAULT = (0.0, 18.0, 110.0)   # az(도), el(도), dist(m)
+    SCROLL_DEG = 0.15              # 스크롤 1단위당 회전 각(도)
+    PRESETS = {ord("1"): (0.0, 18.0), ord("3"): (90.0, 12.0),
+               ord("7"): (0.0, 88.0), ord("9"): (180.0, 14.0)}
+    # 방향키 코드는 운영체제마다 다르다 (macOS / Linux / Windows)
+    LEFT = {63234, 65361, 2424832, ord("4")}
+    RIGHT = {63235, 65363, 2555904, ord("6")}
+    UP = {63232, 65362, 2490368, ord("8")}
+    DOWN = {63233, 65364, 2621440, ord("2")}
+
+    def __init__(self, mode="3d"):
+        self.mode = mode
+        self.night = False   # 밤 화면 여부 (N 키로 전환)
+        self.weather = "clear"   # 날씨 (W 키로 다음 날씨)
+        self.az, self.el, self.dist = self.DEFAULT
+        self._drag = None
+
+    def reset(self):
+        self.az, self.el, self.dist = self.DEFAULT
+
+    def orbit(self, d_az, d_el):
+        self.az = (self.az + d_az + 180.0) % 360.0 - 180.0
+        self.el = float(np.clip(self.el + d_el, 3.0, 88.0))
+
+    def zoom(self, factor):
+        self.dist = float(np.clip(self.dist * factor, 40.0, 1500.0))
+
+    def on_key(self, key) -> bool:
+        """시점 조작 키면 처리하고 True."""
+        if key in (ord("v"), ord("V")):
+            self.mode = "2d" if self.mode == "3d" else "3d"
+        elif key in (ord("n"), ord("N")):
+            self.night = not self.night
+        elif key in (ord("w"), ord("W")):
+            self.next_weather()
+        elif self.mode != "3d":
+            return False
+        elif key in self.LEFT:
+            self.orbit(6.0, 0.0)
+        elif key in self.RIGHT:
+            self.orbit(-6.0, 0.0)
+        elif key in self.UP:
+            self.orbit(0.0, 4.0)
+        elif key in self.DOWN:
+            self.orbit(0.0, -4.0)
+        elif key in (ord("+"), ord("=")):
+            self.zoom(1 / 1.15)
+        elif key in (ord("-"), ord("_")):
+            self.zoom(1.15)
+        elif key in (ord("5"), ord("0")):
+            self.reset()
+        elif key in self.PRESETS:
+            self.az, self.el = self.PRESETS[key]
+        else:
+            return False
+        return True
+
+    def next_weather(self):
+        names = list(WEATHERS)
+        self.weather = names[(names.index(self.weather) + 1) % len(names)]
+
+    def on_mouse(self, event, x, y, flags):
+        if event == cv2.EVENT_LBUTTONDOWN:   # 낮/밤 버튼과 날씨 버튼 (2D·3D 공통)
+            x1, y1, x2, y2 = TIME_BUTTON
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                self.night = not self.night
+                return
+            x1, y1, x2, y2 = WEATHER_BUTTON
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                self.next_weather()
+                return
+        if self.mode != "3d":
+            return
+        if event == cv2.EVENT_LBUTTONDOWN and x < W:
+            self._drag = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and self._drag and flags & cv2.EVENT_FLAG_LBUTTON:
+            dx, dy = x - self._drag[0], y - self._drag[1]
+            self.orbit(dx * 0.4, dy * 0.3)
+            self._drag = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._drag = None
+        elif event == cv2.EVENT_RBUTTONDOWN and x < W:
+            self.reset()
+        elif event in (cv2.EVENT_MOUSEWHEEL, cv2.EVENT_MOUSEHWHEEL):
+            # 트랙패드 두 손가락 스크롤(또는 마우스 휠)
+            dx, dy = self._scroll_delta(event, x, y, flags)
+            if flags & (cv2.EVENT_FLAG_CTRLKEY | cv2.EVENT_FLAG_ALTKEY):   # Ctrl/Option + 스크롤 = 확대/축소
+                self.zoom(math.exp(-float(np.clip(dy, -40, 40)) * 0.006))
+            else:   # 좌우 스크롤 = 둘레 회전, 상하 스크롤 = 높이
+                self.orbit(float(np.clip(dx * self.SCROLL_DEG, -12.0, 12.0)),
+                           float(np.clip(dy * self.SCROLL_DEG, -12.0, 12.0)))
+
+    @staticmethod
+    def _scroll_delta(event, x, y, flags):
+        """스크롤 양 (가로, 세로). OpenCV가 운영체제마다 다른 자리에 넣어 준다."""
+        if sys.platform == "darwin":
+            # macOS(Cocoa)에서는 스크롤 이벤트의 x, y 인자가 마우스 위치가 아니라 스크롤 양이다
+            return x, y
+        delta = (flags >> 16) & 0xFFFF   # 그 밖에는 flags 상위 16비트(부호 있음)
+        if delta >= 0x8000:
+            delta -= 0x10000
+        return (delta, 0) if event == cv2.EVENT_MOUSEHWHEEL else (0, delta)
+
+class Camera:
+    """한 프레임의 카메라: 월드 좌표(x 동, y 북, z 위) -> 카메라 좌표 -> 화면."""
+
+    def __init__(self, view, ac):
+        self.target = np.array([ac.x, ac.y, ac.alt + GEAR_HEIGHT])
+        a = math.radians(ac.heading + view.az)
+        e = math.radians(view.el)
+        back = np.array([-math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)])
+        self.eye = self.target + back * view.dist
+        self.eye[2] = max(self.eye[2], 1.5)
+        f = self.target - self.eye
+        f /= np.linalg.norm(f)
+        r = np.cross(f, [0.0, 0.0, 1.0])
+        r /= np.linalg.norm(r)
+        self.rot = np.array([r, np.cross(r, f), f])   # 행: 오른쪽, 위, 앞
+        self.forward = f
+
+    def to_cam(self, pts):
+        return (np.asarray(pts, np.float64) - self.eye) @ self.rot.T
+
+    @staticmethod
+    def project(pc):
+        """카메라 좌표 (N,3) -> 화면 좌표 (N,2). z > 0 이어야 한다."""
+        return np.stack([CX + FOCAL * pc[:, 0] / pc[:, 2], CY - FOCAL * pc[:, 1] / pc[:, 2]], 1)
+
+    def ground_homography(self, ax, bx, ay, by):
+        """질감 픽셀 (tx, ty) -> 지면 (X = ax*tx + bx, Y = ay*ty + by, 0) -> 화면."""
+        k = np.array([[FOCAL, 0, CX], [0, -FOCAL, CY], [0, 0, 1.0]])
+        plane = np.array([[1, 0, -self.eye[0]], [0, 1, -self.eye[1]], [0, 0, -self.eye[2]]])
+        return k @ self.rot @ plane @ np.array([[ax, 0, bx], [0, ay, by], [0, 0, 1.0]])
+
+    @property
+    def horizon_y(self):
+        fz = self.forward[2]
+        return CY + FOCAL * fz / math.sqrt(max(1.0 - fz * fz, 1e-9))
+
+
+def clip_near(pc):
+    """카메라 좌표 다각형을 z >= NEAR 로 자른다 (Sutherland-Hodgman)."""
+    out = []
+    n = len(pc)
+    for i in range(n):
+        a, b = pc[i], pc[(i + 1) % n]
+        a_in, b_in = a[2] >= NEAR, b[2] >= NEAR
+        if a_in:
+            out.append(a)
+        if a_in != b_in:
+            out.append(a + (b - a) * (NEAR - a[2]) / (b[2] - a[2]))
+    return np.array(out) if len(out) >= 3 else None
+
+
+def to_px(uv):
+    """화면 좌표를 OpenCV가 받을 수 있는 정수로 (화면 밖으로 아주 멀리 나간 값은 제한)."""
+    return np.round(np.clip(uv, -30000, 30000)).astype(np.int32)
+
+
+def fill_world(img, cam, pts, color, aa=True):
+    """월드 좌표 다각형 하나를 칠한다."""
+    pc = clip_near(cam.to_cam(pts))
+    if pc is not None:
+        cv2.fillPoly(img, [to_px(cam.project(pc))], color, AA if aa else cv2.LINE_8)
+
+
+def line_world(img, cam, p1, p2, color, thick=1):
+    pc = cam.to_cam([p1, p2])
+    if pc[0, 2] < NEAR and pc[1, 2] < NEAR:
+        return
+    for i, j in ((0, 1), (1, 0)):
+        if pc[i, 2] < NEAR:
+            pc[i] = pc[i] + (pc[j] - pc[i]) * (NEAR - pc[i, 2]) / (pc[j, 2] - pc[i, 2])
+    a, b = to_px(cam.project(pc))
+    cv2.line(img, tuple(int(v) for v in a), tuple(int(v) for v in b), color, thick, AA)
+
+
+# ---------------------------------------------------------------- 지면 질감
+
+GRASS_MPP = 2.0   # 잔디 질감 1픽셀 = 2 m, 500픽셀(1 km)마다 반복
+
+
+AP_PPM = 3.0                                   # 공항 질감 해상도 (픽셀/m)
+AP_X0, AP_X1, AP_Y0, AP_Y1 = -330.0, 60.0, -90.0, 1090.0
+
+
+def _make_airport():
+    """활주로·유도로·계류장을 위에서 본 그림(BGR)과 덮을 영역(알파)."""
+    w, h = int((AP_X1 - AP_X0) * AP_PPM), int((AP_Y1 - AP_Y0) * AP_PPM)
+    key = np.array([50, 92, 58], np.uint8)
+    img = np.empty((h, w, 3), np.uint8)
+    img[:] = key
+    to_s = lambda p: (int(round((p[0] - AP_X0) * AP_PPM)), int(round((AP_Y1 - p[1]) * AP_PPM)))
+    ck.draw_airport(img, to_s, AP_PPM)
+    alpha = (np.abs(img.astype(np.int16) - key).sum(2) > 0).astype(np.uint8) * 255
+    return np.dstack([img, alpha])
+
+
+_GRASS = scenery.GRASS_TILE   # 도시 그림의 바탕과 같은 무늬라야 경계가 보이지 않는다
+_AIRPORT = _make_airport()
+
+# 건물 상자: (x1, y1, x2, y2, 높이, 벽 색, 지붕 색)
+BUILDINGS = [
+    (-292, 440, -252, 560, 14.0, (150, 146, 140), (120, 116, 112)),   # 터미널
+    (-292, 584, -256, 612, 10.0, (132, 128, 124), (100, 98, 96)),     # 격납고
+    (-246, 596, -238, 604, 34.0, (170, 168, 164), (90, 110, 130)),    # 관제탑
+]
+
+
+# 도시 그림의 단계별 사용 거리: (축소 단계, 이 거리 안쪽에서만 사용 m). None = 전체
+CITY_LEVELS = ((2, None), (1, 2100.0), (0, 1000.0))
+
+
+def _warp_city(img, cam, levels, transparent):
+    """도시 지면 그림을 원근에 맞게 깐다.
+
+    먼 곳은 축소본, 가까운 곳(화면 아래쪽 행)은 원본을 써서 먼 곳이 자글거리지 않게 한다.
+    transparent=True면 그림 바깥은 img를 그대로 두고, False면 검정(불빛 그림용).
+    """
+    hy = cam.horizon_y
+    for level, max_dist in CITY_LEVELS:
+        y0 = 0 if max_dist is None else int(np.clip(math.ceil(hy + cam.eye[2] * FOCAL / max_dist), 0, H))
+        if y0 >= H:
+            continue
+        mpp = scenery.MPP * (1 << level)
+        hom = cam.ground_homography(mpp, scenery.X0, -mpp, scenery.Y1)
+        hom = np.array([[1, 0, 0], [0, 1, -y0], [0, 0, 1.0]]) @ hom   # 아래쪽 행들만 그린다
+        cv2.warpPerspective(levels[level], hom, (W, H - y0), dst=img[y0:], flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_TRANSPARENT if transparent else cv2.BORDER_CONSTANT)
+
+
+def draw_ground(cam, night=False):
+    img = cv2.warpPerspective(_GRASS, cam.ground_homography(GRASS_MPP, 0, -GRASS_MPP, 0),
+                              (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+    _warp_city(img, cam, scenery.CITY["day"], True)
+    ap = cv2.warpPerspective(_AIRPORT, cam.ground_homography(1 / AP_PPM, AP_X0, -1 / AP_PPM, AP_Y1),
+                             (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=(0, 0, 0, 0))
+    cv2.copyTo(ap[..., :3], cv2.compare(ap[..., 3], 127, cv2.CMP_GT), img)
+    if _wx["snow"]:        # 눈: 지면이 하얗게 덮인다
+        img = cv2.addWeighted(img, 0.5, np.full_like(img, 236), 0.5, 0)
+    if _wx["dim"] < 1.0:   # 흐린 날은 지면이 어둡다
+        img = cv2.convertScaleAbs(img, alpha=_wx["dim"])
+    if not night:
+        return img
+    img = ck.darken(img)   # 밤 = 어둡게 한 낮 그림 + 불빛
+    lights = np.zeros_like(img)
+    _warp_city(lights, cam, scenery.CITY["emission"], False)
+    return cv2.add(img, lights)
+
+
+CITY_MAX_DISTANCE = 4200.0   # 이보다 먼 건물은 입체로 세우지 않는다 (지면 그림의 지붕만 보인다)
+
+
+def city_faces(cam, night):
+    """화면에 보이는 도시 건물 면들: (화면 좌표 (n,4,2), 색 목록, 깊이). 먼 것부터 정렬."""
+    box = scenery.CITY["boxes"]
+    pc = cam.to_cam(box["centers"])
+    z, tall = pc[:, 2], box["heights"]
+    seen = (z > 8.0) & (z < CITY_MAX_DISTANCE) & (np.abs(pc[:, 0]) < z * 0.62 + 120.0)
+    seen &= (z < 1500.0) | (tall > 20.0)      # 멀수록 높은 건물만
+    seen &= (z < 2700.0) | (tall > 45.0)
+    pick = np.flatnonzero(seen[box["owner"]])
+    if not len(pick):
+        return np.zeros((0, 4, 2), np.int32), [], np.zeros(0)
+    verts = box["verts"][pick]
+    facing = np.einsum("ij,ij->i", box["normals"][pick], cam.eye - verts.mean(1)) > 0
+    pick, verts = pick[facing], verts[facing]
+    cam_pts = (verts.reshape(-1, 3) - cam.eye) @ cam.rot.T
+    cam_pts = cam_pts.reshape(-1, 4, 3)
+    front = (cam_pts[:, :, 2] >= NEAR).all(1)
+    pick, cam_pts = pick[front], cam_pts[front]
+    depth = cam_pts[:, :, 2].mean(1)
+    order = np.argsort(-depth)
+    pick, cam_pts, depth = pick[order], cam_pts[order], depth[order]
+    uv = np.stack([CX + FOCAL * cam_pts[..., 0] / cam_pts[..., 2],
+                   CY - FOCAL * cam_pts[..., 1] / cam_pts[..., 2]], -1)
+    keep = np.exp(-depth / _wx["fog"])[:, None]   # 멀수록 지평선 색으로 흐려진다
+    haze = _sky_colors(night)[0]
+    lit = box["night"][pick] if night else box["day"][pick] * _wx["dim"]
+    colors = lit * keep + haze * (1 - keep)
+    return to_px(uv), colors.astype(int).tolist(), depth
+
+
+def draw_city(img, faces, nearer_than=None, farther_than=None):
+    """city_faces()의 면들을 칠한다. 기체보다 먼 것과 가까운 것을 나눠 그리려고 깊이 범위를 받는다."""
+    uv, colors, depth = faces
+    for i in range(len(depth)):
+        if nearer_than is not None and depth[i] >= nearer_than:
+            continue
+        if farther_than is not None and depth[i] < farther_than:
+            continue
+        cv2.fillConvexPoly(img, uv[i], colors[i], AA)
+
+
+NIGHT_HAZE = np.array([46, 30, 20], np.float32)     # 밤의 지평선 색 (BGR)
+NIGHT_ZENITH = np.array([20, 9, 4], np.float32)     # 밤하늘
+NIGHT_AMBIENT = 0.38                                # 밤에 기체·건물에 닿는 빛의 양
+
+
+def _make_stars(n=450, seed=11):
+    """별: 하늘의 고정된 방향(단위 벡터)과 밝기."""
+    rng = np.random.default_rng(seed)
+    d = rng.standard_normal((n, 3))
+    d[:, 2] = np.abs(d[:, 2]) + 0.03
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    return d, rng.uniform(90, 255, n) ** 1.0
+
+
+_STARS, _STAR_LEVEL = _make_stars()
+_MOON = np.array([math.sin(math.radians(35)) * math.cos(math.radians(32)),
+                  math.cos(math.radians(35)) * math.cos(math.radians(32)),
+                  math.sin(math.radians(32))])   # 북동쪽 하늘, 고도 32도
+
+
+_AP_LIGHT_POS = np.array([(x, y, 0.6) for x, y, _c, _s in ck.AIRPORT_LIGHTS], float)
+
+
+_SUN = np.array([math.sin(math.radians(-25)) * math.cos(math.radians(38)),
+                 math.cos(math.radians(-25)) * math.cos(math.radians(38)),
+                 math.sin(math.radians(38))])   # 북서쪽 하늘, 고도 38도
+
+
+CLOUD_RANGE = 7000.0   # 구름이 놓이는 범위 (원점 기준 ±m). 바람에 밀려 나가면 반대편에서 다시 들어온다
+
+
+def _make_clouds(seed=3, clusters=90):
+    """구름 덩어리들: 월드 좌표 (x, y, 밑면 위 높이), 반지름 m, 진하기, 속한 구름 번호.
+
+    구름 하나는 여러 덩어리가 뭉친 것이다. 구름 양(cover)에 따라 앞쪽 번호의 구름만 그린다.
+    """
+    rng = np.random.default_rng(seed)
+    pos, radius, alpha, owner = [], [], [], []
+    for k in range(clusters):
+        cx, cy = rng.uniform(-CLOUD_RANGE, CLOUD_RANGE, 2)
+        cz = rng.uniform(0, 260)
+        size = rng.uniform(0.7, 1.5)
+        for _ in range(int(rng.integers(5, 10))):
+            pos.append((cx + rng.normal(0, 230) * size, cy + rng.normal(0, 150) * size,
+                        cz + abs(rng.normal(0, 40))))
+            radius.append(rng.uniform(140, 300) * size)
+            alpha.append(rng.uniform(0.55, 0.95))
+            owner.append(k)
+    return (np.array(pos), np.array(radius), np.array(alpha), np.array(owner), clusters)
+
+
+_CLOUDS = _make_clouds()
+_CLOUD_SCALE = 2   # 구름은 절반 크기로 그려서 흐리게 한 뒤 키운다 (빠르고 부드럽다)
+
+
+def draw_clouds(img, cam, night, clock, wind=(3.0, -2.5)):
+    """구름: 실제 높이에 떠 있어서 날아가면 지나가고, 바람을 따라 흘러간다."""
+    if _wx["cover"] <= 0.0:
+        return
+    pos, radius, alpha, owner, clusters = _CLOUDS
+    pick = owner < _wx["cover"] * clusters
+    p = pos[pick].copy()
+    p[:, 0] = (p[:, 0] + wind[0] * clock * 4 + CLOUD_RANGE) % (2 * CLOUD_RANGE) - CLOUD_RANGE
+    p[:, 1] = (p[:, 1] + wind[1] * clock * 4 + CLOUD_RANGE) % (2 * CLOUD_RANGE) - CLOUD_RANGE
+    p[:, 2] += _wx["base"]
+    pc = cam.to_cam(p)
+    z = pc[:, 2]
+    r_px = FOCAL * radius[pick] / np.maximum(z, 1.0)
+    u = CX + FOCAL * pc[:, 0] / np.maximum(z, 1.0)
+    v = CY - FOCAL * pc[:, 1] / np.maximum(z, 1.0)
+    ok = (z > 150.0) & (u > -r_px * 1.6) & (u < W + r_px * 1.6) & (v > -r_px) & (v < H + r_px)
+    if not ok.any():
+        return
+    k = _CLOUD_SCALE
+    mask = np.zeros((H // k, W // k), np.uint8)
+    fade = np.exp(-z / (_wx["fog"] * 3.0))   # 먼 구름은 옅다
+    for i in np.flatnonzero(ok)[np.argsort(-z[ok])]:
+        cv2.ellipse(mask, (int(u[i] / k), int(v[i] / k)),
+                    (max(int(r_px[i] * 1.5 / k), 1), max(int(r_px[i] * 0.55 / k), 1)), 0, 0, 360,
+                    int(255 * alpha[pick][i] * fade[i]), -1, AA)
+    mask = cv2.resize(cv2.GaussianBlur(mask, (0, 0), 5), (W, H), interpolation=cv2.INTER_LINEAR)
+    cover = mask.astype(np.float32) * (0.92 / 255.0)
+    color = np.array(_wx["cloud"], np.float32) * (0.2 if night else 1.0)
+    layer = np.empty_like(img)
+    layer[:] = color
+    img[:] = cv2.blendLinear(img, layer, 1.0 - cover, cover)
+
+
+def draw_day_sky(img, cam):
+    """낮 하늘의 해."""
+    hy = cam.horizon_y
+    s = cam.rot @ _SUN
+    if s[2] > 0.05:
+        su, sv = CX + FOCAL * s[0] / s[2], CY - FOCAL * s[1] / s[2]
+        if -80 < su < W + 80 and -80 < sv < hy:
+            for radius, alpha in ((70, 0.18), (44, 0.3), (28, 0.5)):
+                ck.blend_circle(img, (su, sv), radius, (215, 245, 255), alpha)
+            cv2.circle(img, (int(su), int(sv)), 17, (235, 252, 255), -1, AA)
+
+
+def _sky_colors(night):
+    """지금 날씨의 (지평선 색, 높은 하늘 색)."""
+    if not night:
+        return (HAZE, ZENITH) if _wx["sky"] is None else tuple(np.array(c, np.float32) for c in _wx["sky"])
+    if _wx["sky"] is None:
+        return NIGHT_HAZE, NIGHT_ZENITH
+    gray = np.array([34, 30, 28], np.float32) * (0.6 + 0.4 * _wx["dim"])   # 흐린 밤하늘
+    return gray, gray * 0.6
+
+
+# 비·눈 입자: 화면 위의 고정된 씨앗 위치에서 시간에 따라 흘러내린다 (프레임마다 이어지게)
+_PARTICLES = np.random.default_rng(8).random((600, 4))
+
+
+def draw_precipitation(img, clock):
+    """빗줄기와 눈송이 (화면 전체에 겹쳐 그린다)."""
+    h, w = img.shape[:2]
+    if _wx["rain"]:
+        seed = _PARTICLES[:_wx["rain"]]
+        speed = 900.0 + 500.0 * seed[:, 2]                      # 픽셀/초
+        y = (seed[:, 1] * (h + 60) + speed * clock) % (h + 60) - 30
+        x = (seed[:, 0] * (w + 200) - 0.28 * speed * clock) % (w + 200) - 100   # 바람에 비스듬히
+        length = 14 + 16 * seed[:, 3]
+        layer = np.zeros_like(img)
+        for x1, y1, n in zip(x, y, length):
+            cv2.line(layer, (int(x1), int(y1)), (int(x1 - 0.28 * n), int(y1 + n)), (190, 185, 180), 1, AA)
+        cv2.addWeighted(img, 1.0, layer, 0.5, 0, img)
+    if _wx["snow"]:
+        seed = _PARTICLES[:_wx["snow"]]
+        speed = 60.0 + 90.0 * seed[:, 2]
+        y = ((seed[:, 1] * h + speed * clock) % h).astype(np.int32)
+        x = ((seed[:, 0] * w + 26.0 * np.sin(clock * 1.3 + seed[:, 3] * 6.28) - 18.0 * clock) % w).astype(np.int32)
+        big = seed[:, 3] > 0.6
+        img[y, x] = 245
+        img[np.minimum(y[big] + 1, h - 1), x[big]] = 245
+        img[y[big], np.minimum(x[big] + 1, w - 1)] = 245
+        img[np.minimum(y[big] + 1, h - 1), np.minimum(x[big] + 1, w - 1)] = 235
+
+
+def lightning_strength(clock):
+    """뇌우의 번개 밝기 0~1. 몇 초에 한 번, 짧게 두 번 번쩍인다."""
+    if not _wx["lightning"]:
+        return 0.0, 0
+    window = int(clock // 5.0)
+    rng = np.random.default_rng(1000 + window)
+    start = rng.uniform(0.3, 4.2)
+    dt = clock - window * 5.0 - start
+    if 0.0 <= dt < 0.12:
+        return 1.0, window
+    if 0.22 <= dt < 0.32:
+        return 0.6, window
+    return 0.0, window
+
+
+def draw_lightning(img, clock, horizon_y=None):
+    """번개: 화면이 번쩍이고 하늘에 벼락 줄기가 보인다."""
+    strength, window = lightning_strength(clock)
+    if strength <= 0.0:
+        return
+    cv2.convertScaleAbs(img, dst=img, alpha=1.0 + 0.5 * strength, beta=55 * strength)
+    if horizon_y is None or horizon_y < 60:
+        return
+    rng = np.random.default_rng(2000 + window)   # 같은 번개 동안 같은 모양
+    x, y = rng.uniform(80, img.shape[1] - 80), 0.0
+    pts = [(int(x), 0)]
+    while y < horizon_y - 8:
+        y += rng.uniform(18, 46)
+        x += rng.uniform(-34, 34)
+        pts.append((int(x), int(min(y, horizon_y))))
+    cv2.polylines(img, [np.array(pts, np.int32)], False, (255, 235, 220), 3, AA)
+    cv2.polylines(img, [np.array(pts, np.int32)], False, (255, 255, 255), 1, AA)
+
+
+_WEATHER_ICON_COLOR = (235, 235, 235)
+
+
+def draw_weather_button(img, weather):
+    """날씨 전환 버튼: 지금 날씨를 보여주고, 누르면 다음 날씨로 바뀐다."""
+    x1, y1, x2, y2 = WEATHER_BUTTON
+    ck.shade(img, x1, y1, x2, y2, (90, 80, 70), 0.75)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (230, 230, 230), 1)
+    cx, cy = x1 + 20, (y1 + y2) // 2
+    wx = WEATHERS[weather]
+    if weather == "clear":
+        cv2.circle(img, (cx, cy), 7, (120, 235, 255), -1, AA)
+    else:   # 구름 모양 + 비/눈/번개/안개 표시
+        for dx, dy, r in ((-6, 0, 5), (0, -3, 7), (7, 0, 5)):
+            cv2.circle(img, (cx + dx, cy - 3 + dy), r, _WEATHER_ICON_COLOR, -1, AA)
+        if wx["rain"]:
+            for dx in (-6, 0, 6):
+                cv2.line(img, (cx + dx, cy + 5), (cx + dx - 2, cy + 11), (255, 200, 120), 1, AA)
+        if wx["snow"]:
+            for dx in (-6, 0, 6):
+                cv2.circle(img, (cx + dx, cy + 9), 1, (255, 255, 255), -1, AA)
+        if wx["lightning"]:
+            cv2.polylines(img, [np.array([(cx + 2, cy + 2), (cx - 2, cy + 8), (cx + 2, cy + 8), (cx - 1, cy + 13)],
+                                         np.int32)], False, (90, 230, 255), 2, AA)
+        if weather == "fog":
+            for dy in (5, 9):
+                cv2.line(img, (cx - 10, cy + dy), (cx + 10, cy + dy), _WEATHER_ICON_COLOR, 1, AA)
+    ck.text(img, wx["label"], (x1 + 40, cy + 6), 0.5, WHITE, 2)
+
+
+def draw_time_button(img, night):
+    """낮/밤 전환 버튼: 지금 상태를 보여주고, 누르면 바뀐다."""
+    x1, y1, x2, y2 = TIME_BUTTON
+    ck.shade(img, x1, y1, x2, y2, (60, 30, 10) if night else (150, 110, 40), 0.75)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (230, 230, 230), 1)
+    cy = (y1 + y2) // 2
+    if night:   # 초승달
+        cv2.circle(img, (x1 + 18, cy), 9, (225, 235, 240), -1, AA)
+        cv2.circle(img, (x1 + 23, cy - 3), 8, (60, 34, 16), -1, AA)
+    else:       # 해
+        cv2.circle(img, (x1 + 18, cy), 7, (120, 235, 255), -1, AA)
+        for k in range(8):
+            a = math.pi * k / 4
+            cv2.line(img, (int(x1 + 18 + 9 * math.cos(a)), int(cy + 9 * math.sin(a))),
+                     (int(x1 + 18 + 12 * math.cos(a)), int(cy + 12 * math.sin(a))), (120, 235, 255), 1, AA)
+    ck.text(img, "NIGHT" if night else "DAY", (x1 + 38, cy + 6), 0.55, WHITE, 2)
+
+
+def draw_sky_objects(img, cam):
+    """밤하늘의 별과 달. 아주 멀리 있으므로 카메라가 돌 때만 움직인다."""
+    hy = cam.horizon_y
+    pc = _STARS @ cam.rot.T
+    ok = pc[:, 2] > 0.05
+    u = (CX + FOCAL * pc[ok, 0] / pc[ok, 2]).astype(np.int32)
+    v = (CY - FOCAL * pc[ok, 1] / pc[ok, 2]).astype(np.int32)
+    level = _STAR_LEVEL[ok]
+    inside = (u >= 0) & (u < W) & (v >= 0) & (v < min(H, hy - 4))
+    img[v[inside], u[inside]] = level[inside, None].astype(np.uint8)
+
+    m = cam.rot @ _MOON
+    if m[2] > 0.05:
+        mu, mv = CX + FOCAL * m[0] / m[2], CY - FOCAL * m[1] / m[2]
+        if -40 < mu < W + 40 and -40 < mv < hy:
+            ck.blend_circle(img, (mu, mv), 42, (150, 140, 120), 0.12)
+            ck.blend_circle(img, (mu, mv), 24, (190, 180, 160), 0.2)
+            cv2.circle(img, (int(mu), int(mv)), 13, (228, 236, 240), -1, AA)
+            cv2.circle(img, (int(mu) - 4, int(mv) - 3), 3, (205, 214, 220), -1, AA)
+
+
+def draw_point_lights(img, cam, pts, colors, sizes, glow=True):
+    """지상의 점 광원들. 가까우면 크고 번지며, 멀면 한 점으로 흐려진다."""
+    pc = cam.to_cam(pts)
+    for i in np.flatnonzero(pc[:, 2] >= NEAR):
+        z = pc[i, 2]
+        u, v = CX + FOCAL * pc[i, 0] / z, CY - FOCAL * pc[i, 1] / z
+        if not (0 <= u < W and 0 <= v < H):
+            continue
+        fade = math.exp(-z / (_wx["fog"] * 2.0))   # 시야가 나쁘면 불빛도 가까이서만 보인다
+        color = tuple(int(c * fade) for c in colors[i])
+        r = FOCAL * sizes[i] / z
+        if r < 1.0:
+            img[int(v), int(u)] = np.maximum(img[int(v), int(u)], color)
+            continue
+        r = min(r, 6.0)
+        if glow:
+            ck.blend_circle(img, (u, v), r * 2.8, color, 0.22)
+        cv2.circle(img, (int(u), int(v)), int(round(r)), color, -1, AA)
+
+
+def draw_night_lights(img, cam, clock=0.0):
+    """공항 등화와, 높은 빌딩 꼭대기의 깜빡이는 빨간 등."""
+    beacons = scenery.CITY["boxes"]["beacons"]
+    if len(beacons) and clock % 1.6 < 0.8:
+        draw_point_lights(img, cam, beacons, [(70, 70, 255)] * len(beacons), [1.6] * len(beacons),
+                          glow=False)
+    draw_point_lights(img, cam, _AP_LIGHT_POS, [c for _x, _y, c, _s in ck.AIRPORT_LIGHTS],
+                      [s for _x, _y, _c, s in ck.AIRPORT_LIGHTS])
+
+
+def draw_landing_light(img, cam, ac):
+    """낮은 고도에서 기체 앞 지면을 비추는 착륙등 불빛."""
+    if ac.alt > 100.0:
+        return
+    h = math.radians(ac.heading)
+    fwd, right = np.array([math.sin(h), math.cos(h)]), np.array([math.cos(h), -math.sin(h)])
+    center = np.array([ac.x, ac.y]) + fwd * (45.0 + 2.0 * ac.alt)
+    along, across = 30.0 + 0.6 * ac.alt, 12.0 + 0.3 * ac.alt
+    ang = np.linspace(0, 2 * math.pi, 25)[:-1]
+    pts = center + np.outer(np.cos(ang) * along, fwd) + np.outer(np.sin(ang) * across, right)
+    pc = clip_near(cam.to_cam(np.column_stack([pts, np.zeros(len(pts))])))
+    if pc is None:
+        return
+    layer = img.copy()
+    cv2.fillPoly(layer, [to_px(cam.project(pc))], (190, 225, 250), AA)
+    alpha = 0.38 * (1.0 - ac.alt / 100.0) + 0.05
+    cv2.addWeighted(layer, alpha, img, 1 - alpha, 0, img)
+
+
+def draw_fog_and_sky(img, cam, night=False):
+    """먼 지면은 지평선 색으로 흐리게, 지평선 위는 하늘."""
+    haze_color, zenith = _sky_colors(night)
+    hy = cam.horizon_y
+    rows = np.arange(H, dtype=np.float32)
+    top = int(np.clip(math.ceil(hy), 0, H))
+    if top < H:   # 지면: 화면 행마다 지면까지의 거리로 안개 농도를 정한다
+        dist = cam.eye[2] * FOCAL / np.maximum(rows[top:] - hy, 0.5)
+        keep = np.repeat(np.exp(-dist / _wx["fog"]).astype(np.float32)[:, None], W, axis=1)
+        haze = np.empty((H - top, W, 3), np.uint8)
+        haze[:] = haze_color
+        img[top:] = cv2.blendLinear(img[top:], haze, keep, 1.0 - keep)
+    if top > 0:   # 하늘: 지평선에서 위로 갈수록 짙은 파랑
+        k = np.clip((hy - rows[:top]) / (FOCAL * 0.9), 0.0, 1.0)[:, None] ** 0.7
+        img[:top] = (haze_color * (1 - k) + zenith * k).astype(np.uint8)[:, None, :]
+        if _wx["sun"]:   # 맑거나 구름이 조금 낀 날에만 해·달·별이 보인다
+            if night:
+                draw_sky_objects(img, cam)
+            else:
+                draw_day_sky(img, cam)
+
+
+def _shaded(color, normal, ambient=1.0):
+    """면의 법선과 빛 방향으로 밝기를 정한다. ambient는 전체 밝기 (밤에는 낮춘다)."""
+    k = (0.55 + 0.45 * max(float(normal @ SUN), 0.0)) * ambient
+    return tuple(int(c * k) for c in color)
+
+
+def draw_buildings(img, cam, night=False, clock=0.0):
+    faces = []
+    for x1, y1, x2, y2, h, wall, roof in BUILDINGS:
+        c = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        faces.append(([(x, y, h) for x, y in c], roof, np.array([0, 0, 1.0])))
+        for i in range(4):
+            (ax, ay), (bx, by) = c[i], c[(i + 1) % 4]
+            n = np.array([by - ay, ax - bx, 0.0])
+            n /= np.linalg.norm(n)
+            if n @ (cam.eye - np.array([ax, ay, 0.0])) > 0:   # 카메라를 향한 벽만
+                faces.append(([(ax, ay, 0), (bx, by, 0), (bx, by, h), (ax, ay, h)], wall, n))
+    faces.sort(key=lambda f: -np.linalg.norm(np.mean(f[0], 0) - cam.eye))
+    for pts, color, n in faces:
+        fill_world(img, cam, pts, _shaded(color, n, NIGHT_AMBIENT * 0.8 if night else _wx["dim"]))
+    if night and int(clock * 1.2) % 2 == 0:   # 관제탑 꼭대기의 깜빡이는 빨간 등
+        x1, y1, x2, y2, h = BUILDINGS[2][:5]
+        draw_point_lights(img, cam, np.array([[(x1 + x2) / 2, (y1 + y2) / 2, h + 1.5]]),
+                          [(60, 60, 255)], [1.2])
+
+
+# ---------------------------------------------------------------- 목표 경로
+
+PATH_HALF_WIDTH = 2.5   # 지면 위 경로 띠의 반폭 (m)
+
+
+def draw_targets(img, cam, sc):
+    for shape in sc.targets():
+        if shape[0] == "line":
+            (x1, y1), (x2, y2) = shape[1], shape[2]
+            d = np.array([x2 - x1, y2 - y1], float)
+            d /= np.linalg.norm(d)
+            px, py = -d[1] * PATH_HALF_WIDTH, d[0] * PATH_HALF_WIDTH
+            fill_world(img, cam, [(x1 + px, y1 + py, 0), (x2 + px, y2 + py, 0),
+                                  (x2 - px, y2 - py, 0), (x1 - px, y1 - py, 0)], MAGENTA)
+            line_world(img, cam, (x1, y1, 0), (x2, y2, 0), MAGENTA, 1)   # 멀리서도 보이게
+        elif shape[0] == "circle":
+            (cx, cy), r = shape[1], shape[2]
+            ang = np.linspace(0, 2 * math.pi, 97)
+            cs, sn = np.cos(ang), np.sin(ang)
+            rings = [cam.to_cam(np.column_stack([cx + rr * cs, cy + rr * sn, np.zeros(97)]))
+                     for rr in (r - PATH_HALF_WIDTH, r + PATH_HALF_WIDTH)]
+            if all((ring[:, 2] >= NEAR).all() for ring in rings):
+                # 원 전체가 카메라 앞에 있으면 고리를 한 번에 칠한다 (안쪽 원은 구멍)
+                cv2.fillPoly(img, [to_px(cam.project(ring)) for ring in rings], MAGENTA, AA)
+                continue
+            for i in range(96):
+                quad = [(cx + rr * cs[j], cy + rr * sn[j], 0)
+                        for rr, j in ((r - PATH_HALF_WIDTH, i), (r + PATH_HALF_WIDTH, i),
+                                      (r + PATH_HALF_WIDTH, i + 1), (r - PATH_HALF_WIDTH, i + 1))]
+                fill_world(img, cam, quad, MAGENTA, aa=False)
+                line_world(img, cam, (cx + r * cs[i], cy + r * sn[i], 0),
+                           (cx + r * cs[i + 1], cy + r * sn[i + 1], 0), MAGENTA, 1)
+        elif shape[0] == "path":    # 꺾은선 경로 (장주 비행): 구간마다 지면 띠
+            pts = np.array(shape[1], float)
+            d = np.diff(pts, axis=0)
+            d /= np.linalg.norm(d, axis=1, keepdims=True)
+            side = np.column_stack([-d[:, 1], d[:, 0]]) * PATH_HALF_WIDTH
+            for (x1, y1), (x2, y2), (px, py) in zip(pts[:-1], pts[1:], side):
+                fill_world(img, cam, [(x1 + px, y1 + py, 0), (x2 + px, y2 + py, 0),
+                                      (x2 - px, y2 - py, 0), (x1 - px, y1 - py, 0)], MAGENTA, aa=False)
+                line_world(img, cam, (x1, y1, 0), (x2, y2, 0), MAGENTA, 1)
+        elif shape[0] == "point":   # 웨이포인트: 지면 마름모 + 수직 기둥 + 별
+            x, y = shape[1]
+            fill_world(img, cam, [(x, y - 18, 0), (x + 18, y, 0), (x, y + 18, 0), (x - 18, y, 0)],
+                       MAGENTA)
+            line_world(img, cam, (x, y, 0), (x, y, 70), MAGENTA, 2)
+            pc = cam.to_cam([(x, y, 70)])
+            if pc[0, 2] >= NEAR:
+                u, v = (int(k) for k in to_px(cam.project(pc))[0])
+                star = np.array([(u, v - 12), (u + 4, v - 4), (u + 12, v), (u + 4, v + 4),
+                                 (u, v + 12), (u - 4, v + 4), (u - 12, v), (u - 4, v - 4)], np.int32)
+                cv2.fillPoly(img, [star], MAGENTA, AA)
+                cv2.polylines(img, [star], True, WHITE, 1, AA)
+
+
+# ---------------------------------------------------------------- 기체 3D 모델
+
+# 기체 좌표 (m): x = 오른쪽, y = 앞, z = 위. 길이 38 m, 날개폭 36 m.
+C_BODY, C_WINDOW, C_WING = (242, 242, 242), (95, 75, 60), (215, 215, 218)
+C_TAIL, C_ENGINE, C_INTAKE = (170, 95, 30), (165, 165, 170), (45, 45, 50)
+
+
+def _build_aircraft():
+    faces = []   # (꼭짓점 (k,3), 색, 닫힌 입체의 면인지)
+
+    def add(pts, color, ref=None):
+        """ref(입체 안쪽 점)를 주면 법선이 바깥을 향하도록 꼭짓점 순서를 맞춘다."""
+        pts = np.array(pts, float)
+        if ref is not None and _normal(pts) @ (pts.mean(0) - np.array(ref, float)) < 0:
+            pts = pts[::-1]
+        faces.append((pts, color, ref is not None))
+
+    def tube(stations, n, x_off, color_fn, caps=None):
+        ang = [2 * math.pi * j / n for j in range(n)]
+        rings = [[(x_off + r * math.cos(a), y, zc + r * math.sin(a)) for a in ang]
+                 for y, r, zc in stations]
+        for i in range(len(rings) - 1):
+            ref = (x_off, (stations[i][0] + stations[i + 1][0]) / 2,
+                   (stations[i][2] + stations[i + 1][2]) / 2)
+            for j in range(n):
+                k = (j + 1) % n
+                add([rings[i][j], rings[i][k], rings[i + 1][k], rings[i + 1][j]],
+                    color_fn(i, j), ref)
+        if caps:
+            mid = (x_off, (stations[0][0] + stations[-1][0]) / 2, stations[0][2])
+            add(rings[0], caps[0], mid)
+            add(rings[-1], caps[1], mid)
+
+    # 동체: (y, 반지름, 중심 높이). 조종석 창과 객실 창 띠는 면 색으로 표현
+    fuselage = [(19, 0.2, -0.4), (17.5, 1.15, -0.25), (16.3, 1.55, -0.1), (14.5, 1.85, 0),
+                (11, 1.9, 0), (-8, 1.9, 0), (-14, 1.3, 0.45), (-19, 0.3, 1.1)]
+
+    def body_color(i, j):
+        if i == 1 and 1 <= j <= 4:
+            return C_WINDOW
+        if i in (3, 4) and j in (0, 5):
+            return C_WINDOW
+        return C_BODY
+
+    tube(fuselage, 12, 0.0, body_color)
+
+    for s in (1, -1):   # 좌우 대칭 부품
+        add([(s * 1.7, 4.0, -0.9), (s * 18, -4.0, 0.4), (s * 18, -6.5, 0.4), (s * 1.7, -3.5, -0.9)],
+            C_WING)                                                     # 주날개
+        add([(s * 18, -4.0, 0.4), (s * 18.3, -5.6, 2.2), (s * 18.3, -6.8, 2.2), (s * 18, -6.5, 0.4)],
+            C_TAIL)                                                     # 윙렛
+        add([(s * 1.0, -14.5, 0.6), (s * 6.5, -17.5, 0.9), (s * 6.5, -19, 0.9), (s * 1.0, -18, 0.6)],
+            C_WING)                                                     # 수평 꼬리날개
+        tube([(4.6, 1.05, -2.1), (0.4, 0.85, -2.1)], 8, s * 6.0, lambda i, j: C_ENGINE,
+             caps=(C_INTAKE, C_INTAKE))                                 # 엔진
+    add([(0, -12.5, 1.6), (0, -17.5, 7.8), (0, -19.4, 7.8), (0, -18.6, 1.2)], C_TAIL)   # 수직 꼬리날개
+
+    verts = np.concatenate([f[0] for f in faces])
+    ends = np.cumsum([len(f[0]) for f in faces])
+    return {
+        "verts": verts,
+        "spans": list(zip(ends - [len(f[0]) for f in faces], ends)),
+        "normals": np.array([_normal(f[0]) for f in faces]),
+        "centers": np.array([f[0].mean(0) for f in faces]),
+        "colors": np.array([f[1] for f in faces], float),
+        "closed": np.array([f[2] for f in faces]),
+    }
+
+
+def _normal(pts):
+    """다각형의 단위 법선 (Newell 방법: 찌그러진 사각형에도 안정적)."""
+    p = pts - pts.mean(0)
+    n = np.cross(p, np.roll(p, -1, axis=0)).sum(0)
+    return n / (np.linalg.norm(n) + 1e-12)
+
+
+_MODEL = _build_aircraft()
+# 착륙 장치: (기체 좌표 위쪽 끝, 바퀴 위치)
+_GEAR = [((0, 14, -1.7), (0, 14, -GEAR_HEIGHT + 0.5)),
+         ((2.8, -1.5, -1.2), (2.8, -1.5, -GEAR_HEIGHT + 0.5)),
+         ((-2.8, -1.5, -1.2), (-2.8, -1.5, -GEAR_HEIGHT + 0.5))]
+_SHADOW = np.array(ck._OUTLINE, float) * 19.0   # 위에서 본 윤곽 (그림자용)
+
+
+def body_rotation(heading_deg, bank_deg, pitch_deg):
+    """기체 좌표 -> 월드 좌표 회전. 뱅크(+ = 오른쪽 날개 아래) -> 피치(+ = 기수 위) -> 방위."""
+    h, b, p = (math.radians(v) for v in (heading_deg, bank_deg, pitch_deg))
+    rb = np.array([[math.cos(b), 0, math.sin(b)], [0, 1, 0], [-math.sin(b), 0, math.cos(b)]])
+    rp = np.array([[1, 0, 0], [0, math.cos(p), -math.sin(p)], [0, math.sin(p), math.cos(p)]])
+    rh = np.array([[math.cos(h), math.sin(h), 0], [-math.sin(h), math.cos(h), 0], [0, 0, 1]])
+    return rh @ rp @ rb
+
+
+def draw_shadow(img, cam, ac):
+    """해가 바로 위에 있다고 보고 기체 윤곽을 지면에 떨군다. 높을수록 옅다."""
+    rot = body_rotation(ac.heading, 0, 0)[:2, :2]
+    pts = _SHADOW @ rot.T + (ac.x, ac.y)
+    pc = cam.to_cam(np.column_stack([pts, np.zeros(len(pts))]))
+    if (pc[:, 2] < NEAR).any():
+        return
+    alpha = 0.5 - 0.25 * min(ac.alt / 200.0, 1.0)
+    layer = img.copy()
+    cv2.fillPoly(layer, [to_px(cam.project(pc))], (20, 30, 20), AA)
+    cv2.addWeighted(layer, alpha, img, 1 - alpha, 0, img)
+
+
+# 항공등: (기체 좌표, 색 BGR, 크기 m, 깜빡임). 깜빡임 None = 계속 켜짐
+_NAV_LIGHTS = [
+    ((-18.2, -5.4, 1.2), (60, 60, 255), 0.55, None),      # 왼쪽 날개 끝: 빨강
+    ((18.2, -5.4, 1.2), (90, 255, 90), 0.55, None),       # 오른쪽 날개 끝: 초록
+    ((0.0, -19.3, 1.4), (240, 240, 240), 0.45, None),     # 꼬리: 흰색
+    ((0.0, 2.0, 2.2), (60, 60, 255), 0.7, "beacon"),      # 동체 위 충돌 방지등: 빨강 점멸
+    ((-18.0, -6.3, 0.5), (255, 255, 255), 0.9, "strobe"),  # 날개 끝 섬광등: 흰색 섬광
+    ((18.0, -6.3, 0.5), (255, 255, 255), 0.9, "strobe"),
+]
+
+
+def draw_aircraft_lights(img, cam, rot, pos, clock):
+    lit = {None: True, "beacon": clock % 1.2 < 0.25, "strobe": clock % 1.5 < 0.08}
+    on = [light for light in _NAV_LIGHTS if lit[light[3]]]
+    pts = np.array([p for p, _c, _s, _b in on], float) @ rot.T + pos
+    draw_point_lights(img, cam, pts, [c for _p, c, _s, _b in on], [s for _p, _c, s, _b in on])
+
+
+def draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night=False, clock=0.0):
+    rot = body_rotation(ac.heading, bank_deg, pitch_deg)
+    pos = cam.target
+    pc = cam.to_cam(_MODEL["verts"] @ rot.T + pos)
+    if (pc[:, 2] < NEAR).any():   # 카메라가 기체 안으로 들어간 경우
+        return
+    uv = to_px(cam.project(pc))
+
+    if ac.alt < 60.0:   # 낮은 고도에서는 착륙 장치를 내린다
+        scale = FOCAL / max(float(np.linalg.norm(pos - cam.eye)), 1.0)
+        for top, wheel in _GEAR:
+            g = cam.to_cam(np.array([top, wheel], float) @ rot.T + pos)
+            if (g[:, 2] < NEAR).any():
+                continue
+            a, b = to_px(cam.project(g))
+            cv2.line(img, tuple(map(int, a)), tuple(map(int, b)), (70, 70, 70),
+                     max(1, int(scale * 0.35)), AA)
+            cv2.circle(img, tuple(map(int, b)), max(1, int(scale * 0.55)), (30, 30, 30), -1, AA)
+
+    ambient = NIGHT_AMBIENT if night else _wx["dim"]
+    normals = _MODEL["normals"] @ rot.T
+    centers = _MODEL["centers"] @ rot.T + pos
+    facing = np.einsum("ij,ij->i", normals, cam.eye - centers)
+    depth = np.linalg.norm(centers - cam.eye, axis=1)
+    for i in np.argsort(-depth):   # 먼 면부터
+        n = normals[i]
+        if facing[i] <= 0:
+            if _MODEL["closed"][i]:
+                continue   # 입체의 뒷면은 보이지 않는다
+            n = -n         # 날개 같은 얇은 판은 양면
+        a, b = _MODEL["spans"][i]
+        cv2.fillPoly(img, [uv[a:b]], _shaded(_MODEL["colors"][i], n, ambient), AA)
+    if night:
+        draw_aircraft_lights(img, cam, rot, pos, clock)
+
+
+def draw_trail(img, cam, trail):
+    if len(trail) < 2:
+        return
+    pts = np.array([(p[0], p[1], (p[2] if len(p) > 2 else 0.0) + GEAR_HEIGHT) for p in trail])
+    pc = cam.to_cam(pts)
+    ok = pc[:, 2] >= NEAR
+    uv = to_px(cam.project(np.where(ok[:, None], pc, [0, 0, 1.0])))
+    start = None
+    for i in range(len(pts) + 1):   # 카메라 앞에 있는 구간만 이어서 그린다
+        if i < len(pts) and ok[i]:
+            start = i if start is None else start
+        elif start is not None:
+            if i - start >= 2:
+                cv2.polylines(img, [uv[start:i]], False, CYAN, 2, AA)
+            start = None
+
+
+# ---------------------------------------------------------------- 화면 조립
+
+HELP_3D = "DRAG/SCROLL/ARROWS: ROTATE   + -: ZOOM   1 3 7 9: VIEW   5: RESET   V: 2D   N: DAY/NIGHT   W: WEATHER"
+HELP_2D = "V: 3D VIEW    N: DAY/NIGHT    W: WEATHER"
+MINIMAP = 170
+_mini = {"img": None, "n": 0}
+
+
+def draw_marks(img, cam, fx):
+    """이륙·접지 지점을 지면 원과 깃대로 표시."""
+    for mark, label, color in ((fx.liftoff, "LIFTOFF", ck.GREEN), (fx.touchdown, "TOUCHDOWN", WHITE)):
+        if not mark:
+            continue
+        x, y = mark
+        ang = np.linspace(0, 2 * math.pi, 17)[:-1]
+        fill_world(img, cam, [(x + 5 * math.cos(a), y + 5 * math.sin(a), 0) for a in ang], color)
+        line_world(img, cam, (x, y, 0), (x, y, 14), color, 2)
+        pc = cam.to_cam([(x, y, 14)])
+        if pc[0, 2] >= NEAR:
+            u, v = (int(k) for k in to_px(cam.project(pc))[0])
+            ck.text(img, label, (u + 6, v + 4), 0.42, color)
+
+
+def draw_smoke(img, cam, fx):
+    """접지 순간의 타이어 연기."""
+    for x, y, z, radius, alpha in fx.smoke():
+        pc = cam.to_cam([(x, y, z)])
+        if pc[0, 2] >= NEAR:
+            u, v = to_px(cam.project(pc))[0]
+            ck.blend_circle(img, (u, v), FOCAL * radius / pc[0, 2], (228, 228, 228), alpha)
+
+
+WINDSOCKS = [(-45.0, 150.0), (-45.0, 850.0)]   # 활주로 양 끝 옆의 바람자루 위치
+
+
+def draw_windsocks(img, cam, env):
+    """바람자루: 바람이 가는 쪽으로 눕고, 약하면 축 처진다."""
+    wx, wy = env.wind
+    speed = math.hypot(wx, wy)
+    ux, uy = (wx / speed, wy / speed) if speed > 0.3 else (0.0, 0.0)
+    lift = min(speed / 8.0, 1.0)   # 8 m/s 이상이면 수평으로 뻗는다
+    reach, drop = 7.0 * (0.25 + 0.75 * lift), 5.0 * (1.0 - lift)
+    for px, py in WINDSOCKS:
+        line_world(img, cam, (px, py, 0), (px, py, 10.2), (210, 210, 210), 2)
+        tx, ty, tz = px + ux * reach, py + uy * reach, 9.0 - drop
+        fill_world(img, cam, [(px, py, 10.2), (px, py, 7.8), (tx, ty, tz - 0.5), (tx, ty, tz + 0.5)],
+                   (0, 130, 255))
+
+
+def draw_scene(view, sc, ac, trail, fx):
+    bank_deg, pitch_deg = fx.bank, fx.pitch
+    night = view.night
+    cam = Camera(view, ac)
+    img = draw_ground(cam, night)
+    draw_targets(img, cam, sc)
+    draw_marks(img, cam, fx)
+    if night:
+        draw_landing_light(img, cam, ac)   # 밤에는 그림자 대신 착륙등 불빛
+    elif _wx["sun"]:
+        draw_shadow(img, cam, ac)          # 해가 가려진 날에는 그림자가 없다
+    draw_fog_and_sky(img, cam, night)
+    wind = fx.env.wind if fx.env is not None and fx.env.wind_speed > 0 else (3.0, -2.5)
+    draw_clouds(img, cam, night, fx.clock, wind)
+    faces = city_faces(cam, night)
+    plane_depth = float(cam.to_cam([cam.target])[0, 2])
+    draw_city(img, faces, farther_than=plane_depth)   # 기체보다 먼 건물
+    if night:
+        draw_night_lights(img, cam, fx.clock)
+    draw_buildings(img, cam, night, fx.clock)
+    if fx.env is not None:
+        draw_windsocks(img, cam, fx.env)
+    draw_trail(img, cam, trail)
+    if ac.alt > 3.0:   # 지면 위 위치를 알 수 있게 수직선
+        line_world(img, cam, (ac.x, ac.y, 0), (ac.x, ac.y, ac.alt + GEAR_HEIGHT - 2), (230, 230, 230), 1)
+    draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night, fx.clock)
+    draw_city(img, faces, nearer_than=plane_depth)    # 기체보다 가까운 건물은 기체를 가린다
+    draw_smoke(img, cam, fx)
+    draw_lightning(img, fx.clock, cam.horizon_y)
+    return img
+
+
+def render(view, sc, ac, trail, ctrl, cam_frame, hand, phase, t, info, fx):
+    """한 프레임 전체(왼쪽 화면 + 계기판)를 그린다."""
+    global _wx
+    _wx = WEATHERS[view.weather]
+    if view.mode == "3d":
+        scene = draw_scene(view, sc, ac, trail, fx)
+        # 미니맵 (오른쪽 아래): 경로에서 벗어난 정도를 위에서 확인
+        _mini["n"] += 1
+        if _mini["img"] is None or _mini["n"] % 3 == 0:   # 미니맵은 3프레임에 한 번만 다시 그린다
+            _mini["img"] = cv2.resize(ck.draw_map(sc, ac, trail, decorations=False, fx=fx, night=view.night),
+                                      (MINIMAP, MINIMAP), interpolation=cv2.INTER_AREA)
+        mini = _mini["img"]
+        x0, y0 = W - MINIMAP - 10, H - MINIMAP - 34
+        scene[y0:y0 + MINIMAP, x0:x0 + MINIMAP] = mini
+        cv2.rectangle(scene, (x0 - 1, y0 - 1), (x0 + MINIMAP, y0 + MINIMAP), (200, 200, 200), 1)
+        help_text = HELP_3D
+    else:
+        scene = ck.draw_map(sc, ac, trail, fx=fx, night=view.night)
+        draw_lightning(scene, fx.clock)
+        help_text = HELP_2D
+    draw_precipitation(scene, fx.clock)
+    ck.draw_overlays(scene, sc, ac, phase, t, info, fx)
+    draw_time_button(scene, view.night)
+    draw_weather_button(scene, view.weather)
+    if info.get("hint"):   # 모드별 추가 조작 안내 (예: 자유 비행의 R 키)
+        help_text += "    " + info["hint"]
+    if view.mode == "3d":
+        ck.shade(scene, 0, H - 24, W, H, alpha=0.6)
+        ck.text(scene, help_text, (10, H - 8), 0.36, (225, 225, 225))
+    else:
+        ck.text(scene, help_text, (W - 12, H - 12), 0.42, WHITE, 1, "r")
+    return ck.compose(scene, sc, ac, ctrl, cam_frame, hand, info, fx)
