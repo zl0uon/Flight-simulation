@@ -473,7 +473,116 @@ def _resample(pts, step):
     return out
 
 
-class Circuit(Scenario):
+class PathScenario(Scenario):
+    """점 목록(self.path, STEP 간격)으로 된 경로를 따라가는 과제의 공통 부분."""
+    STEP = 10.0   # 경로 오차 계산용 점 간격 (m)
+
+    def _nearest(self, ac):
+        """진행 위치 근처(뒤 100 m ~ 앞 400 m)에서 가장 가까운 경로 점 (번호, 거리).
+
+        범위를 제한해야 상승 구간과 최종 접근 구간(둘 다 x=0)을 혼동하지 않는다.
+        """
+        lo = max(self.idx - 10, 0)
+        hi = min(self.idx + 40, len(self.path) - 1)
+        best = min(range(lo, hi + 1),
+                   key=lambda i: (self.path[i][0] - ac.x) ** 2 + (self.path[i][1] - ac.y) ** 2)
+        return best, math.hypot(self.path[best][0] - ac.x, self.path[best][1] - ac.y)
+
+    def path_error(self, ac):
+        return self._nearest(ac)[1]
+
+
+def _turtle_path(start, heading_deg, legs, arc_step_deg):
+    """직선과 원호를 이어 붙인 경로. legs = ("s", 길이) / ("r" 또는 "l", 도는 각도, 반경)."""
+    x, y = start
+    h = math.radians(heading_deg)   # 0 = 북쪽, 시계 방향이 +
+    pts = [(x, y)]
+    for leg in legs:
+        if leg[0] == "s":
+            x, y = x + leg[1] * math.sin(h), y + leg[1] * math.cos(h)
+            pts.append((x, y))
+            continue
+        sign = 1.0 if leg[0] == "r" else -1.0
+        n = max(int(round(leg[1] / arc_step_deg)), 1)
+        r = leg[2]
+        cx, cy = x + sign * r * math.cos(h), y - sign * r * math.sin(h)   # 선회 중심
+        for i in range(1, n + 1):
+            hh = h + sign * math.radians(leg[1]) * i / n
+            pts.append((cx - sign * r * math.cos(hh), cy + sign * r * math.sin(hh)))
+        h += sign * math.radians(leg[1])
+        x, y = pts[-1]
+    return pts
+
+
+class Route(PathScenario):
+    """복잡한 경로 비행: 좌우 선회가 이어지는 경로를 따라가며 높은 고도까지 올라갔다 내려온다.
+
+    경로: 북쪽 직선 -> 오른쪽 90도 -> 왼쪽 180도(S자) -> 오른쪽 270도(큰 선회) -> 왼쪽 90도 -> 직선.
+    고도: 150 m에서 출발해 500 m까지 상승, 수평 비행 후 200 m까지 강하한다.
+    경로 끝에 도달하면 성공이다. 고도는 목표 고도와의 차이를 따로 기록한다(성공 판정에는 쓰지 않음).
+    선회 반경은 상승하느라 속도가 빨라져도 최대 뱅크 안에서 돌 수 있게 넉넉히 잡았다.
+    """
+    name = "route"
+    instruction = "ROUTE: follow the winding path, climb to 500 m, then descend to 200 m"
+    error_label = "PATH / ALT ERR"
+    timeout = 360.0
+    view_scale = 0.16
+    RADIUS = 450.0
+    START_ALT = 150.0
+    LEGS = [("s", 500.0), ("r", 90.0, RADIUS), ("s", 400.0), ("l", 180.0, RADIUS), ("s", 600.0),
+            ("r", 270.0, RADIUS), ("s", 500.0), ("l", 90.0, RADIUS), ("s", 600.0)]
+    # 고도 계획: (경로 진행률, 목표 고도 m). 사이는 직선으로 잇는다
+    PROFILE = [(0.0, 150.0), (0.08, 150.0), (0.48, 500.0), (0.60, 500.0), (0.96, 200.0), (1.0, 200.0)]
+
+    def __init__(self):
+        super().__init__()
+        self.outline = _turtle_path((0.0, 0.0), 0.0, self.LEGS, 6.0)
+        self.path = _resample(_turtle_path((0.0, 0.0), 0.0, self.LEGS, 2.0), self.STEP)
+        self.idx = 0
+        last = len(self.path) - 1
+        # 공중에 그릴 목표 고도 경로 (60 m 간격)와 고도가 바뀌는 지점의 표지
+        self.air = [(x, y, self._alt_at(i / last)) for i, (x, y) in enumerate(self.path)][::6]
+        self.gates = [(self.path[int(f * last)], alt) for f, alt in self.PROFILE[2:]
+                      if f in (0.48, 0.60, 1.0)]
+
+    def _alt_at(self, frac: float) -> float:
+        for (f1, a1), (f2, a2) in zip(self.PROFILE, self.PROFILE[1:]):
+            if frac <= f2:
+                return a1 + (a2 - a1) * (frac - f1) / (f2 - f1)
+        return self.PROFILE[-1][1]
+
+    @property
+    def progress(self) -> float:
+        return self.idx / (len(self.path) - 1)
+
+    @property
+    def target_alt(self) -> float:
+        """지금 위치에서 지켜야 할 고도 (m)."""
+        return self._alt_at(self.progress)
+
+    def alt_error(self, ac) -> float:
+        return ac.alt - self.target_alt
+
+    def error_text(self, ac) -> str:
+        return f"{self.path_error(ac):.0f} m / {self.alt_error(ac):+.0f} m"
+
+    def initial_aircraft(self):
+        return Aircraft(x=0.0, y=0.0, heading=0.0, speed=V_LEVEL, alt=self.START_ALT, airborne=True)
+
+    def targets(self):
+        i = self.idx // 6   # 공중 선은 지금 위치 근처(뒤 300 m ~ 앞 1.5 km)만: 전부 그리면 화면이 어지럽다
+        return ([("path", self.outline), ("airpath", self.air[max(i - 5, 0):i + 26])]
+                + [("gate", p, alt) for p, alt in self.gates])
+
+    def update(self, ac, event, t):
+        self.idx = max(self.idx, self._nearest(ac)[0])
+        if event == "touchdown":
+            self.finish("fail", "ground impact")
+        elif self.idx >= len(self.path) - 2:
+            self.finish("success", t=t)
+
+
+class Circuit(PathScenario):
     """장주 비행: 이륙 -> 상승 -> 오른쪽 선회 -> 배풍 구간 -> 오른쪽 선회 -> 최종 접근 -> 착륙.
 
     한 번의 시도로 이륙부터 착륙까지 이어서 비행한다. 경로는 활주로(x=0)를 한 변으로 하는
@@ -488,7 +597,6 @@ class Circuit(Scenario):
     RADIUS = 250.0      # 선회 반경 (roll 약 0.5, 수평 비행 속도 기준)
     TOP_Y = 1100.0      # 첫 선회를 시작하는 지점
     BOTTOM_Y = -800.0   # 두 번째 선회가 끝나 최종 접근이 시작되는 지점
-    STEP = 10.0         # 경로 오차 계산용 점 간격 (m)
 
     def __init__(self):
         super().__init__()
@@ -517,20 +625,6 @@ class Circuit(Scenario):
 
     def initial_aircraft(self):
         return Aircraft(x=0.0, y=50.0, heading=0.0, speed=0.0, alt=0.0, airborne=False)
-
-    def _nearest(self, ac):
-        """진행 위치 근처(뒤 100 m ~ 앞 400 m)에서 가장 가까운 경로 점 (번호, 거리).
-
-        범위를 제한해야 상승 구간과 최종 접근 구간(둘 다 x=0)을 혼동하지 않는다.
-        """
-        lo = max(self.idx - 10, 0)
-        hi = min(self.idx + 40, len(self.path) - 1)
-        best = min(range(lo, hi + 1),
-                   key=lambda i: (self.path[i][0] - ac.x) ** 2 + (self.path[i][1] - ac.y) ** 2)
-        return best, math.hypot(self.path[best][0] - ac.x, self.path[best][1] - ac.y)
-
-    def path_error(self, ac):
-        return self._nearest(ac)[1]
 
     def targets(self):
         return [("path", self.outline)]
@@ -601,6 +695,8 @@ class FreeFlight(Scenario):
         self.result_title = "ROUGH LANDING" if reasons else "GOOD LANDING"
 
 
-SCENARIOS = {cls.name: cls for cls in (Takeoff, Straight, Turn, Landing, Circuit)}
-# "full" 묶음에 들어가는 기본 과제 순서. circuit은 --scenario circuit 으로 따로 고른다.
+SCENARIOS = {cls.name: cls for cls in (Takeoff, Straight, Turn, Landing, Circuit, Route)}
+# "full" 묶음에 들어가는 기본 과제 순서. circuit과 route는 --scenario 로 따로 고른다.
 SCENARIO_ORDER = ["takeoff", "straight", "turn", "landing"]
+# "all" 묶음: 기본 과제에 이어 복잡한 경로(고도 변화 포함)까지
+SCENARIO_ALL = SCENARIO_ORDER + ["route"]

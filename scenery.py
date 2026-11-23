@@ -55,7 +55,7 @@ FIELDS = [(96, 176, 190), (84, 150, 96), (70, 128, 84), (110, 190, 170), (92, 13
           (76, 164, 120), (120, 170, 150)]
 
 # 건물을 두지 않는 곳: 공항 부지와 접근 경로 아래 (x1, y1, x2, y2)
-KEEP_CLEAR = [(-420.0, -450.0, 180.0, 1450.0), (-170.0, -1750.0, 170.0, -450.0)]
+KEEP_CLEAR = [(-560.0, -450.0, 180.0, 1450.0), (-170.0, -1750.0, 170.0, -450.0)]
 
 
 def px(x, y):
@@ -472,12 +472,17 @@ def _make_grass(seed=7, size=500):
         return n / (n.std() + 1e-6)
 
     n = 0.7 * layer(40) + 0.4 * layer(8) + 0.15 * layer(1.5)
-    tile = np.clip(np.array(GRASS, np.float32) + n[..., None] * np.array([6, 14, 10], np.float32),
-                   0, 255).astype(np.uint8)
-    for k in range(0, size, size // 4):
-        tile[k, :] = (66, 112, 74)
-        tile[:, k] = (66, 112, 74)
-    return tile
+    tile = np.array(GRASS, np.float32) + n[..., None] * np.array([6, 14, 10], np.float32)
+    # 실제 들판처럼: 마른 풀밭 얼룩, 숲 덩어리(짙은 초록 + 나무 알갱이), 숲 가장자리의 그늘
+    dry = np.clip(layer(55) - 0.5, 0.0, 1.2)[..., None]
+    tile += dry * np.array([-6, 16, 22], np.float32)
+    wood = layer(26) + 0.35 * layer(6)
+    forest = np.clip((wood - 0.75) * 4.0, 0.0, 1.0)
+    canopy = np.array(TREE, np.float32) + layer(1.2)[..., None] * np.array([7, 20, 9], np.float32)
+    tile = tile * (1 - forest[..., None]) + canopy * forest[..., None]
+    rim = np.clip(np.roll(forest, (3, -2), (0, 1)) - forest, 0.0, 1.0)[..., None]   # 숲이 드리운 그림자
+    tile *= 1.0 - 0.3 * rim
+    return np.clip(tile, 0, 255).astype(np.uint8)
 
 
 def build():

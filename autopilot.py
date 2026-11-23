@@ -19,6 +19,7 @@ CRUISE_ALT = 150.0      # 직선·선회 과제의 유지 고도 (m)
 PATTERN_ALT = 120.0     # 장주 비행의 유지 고도 (m)
 AIM_Y = 150.0           # 착륙 때 겨냥하는 지점 (활주로 시단에서 안쪽으로, m)
 GLIDE_SLOPE = 0.08      # 접근 강하 기울기 (고도 / 남은 거리)
+PITCH_FULL_ERROR = 30.0  # 고도 오차가 이만큼이면 피치를 끝까지 준다 (m)
 FLARE_ALT = 8.0         # 이 고도 아래에서는 접지 준비
 FLARE_SPEED = 31.0      # 접지 준비 중 이 속도보다 빠르면 스로틀을 줄인다 (m/s)
 
@@ -35,6 +36,37 @@ class Autopilot:
     def control(self, sc, ac):
         """현재 과제(sc)와 기체 상태(ac)를 보고 (roll, 스로틀)을 정한다."""
         return self._roll(sc, ac), self._throttle(sc, ac)
+
+    @staticmethod
+    def pitch(sc, ac):
+        """목표 고도가 변하는 과제(route)에서만 피치로 고도를 맞춘다. 그 밖에는 0 (스로틀로만 조절)."""
+        if not hasattr(sc, "target_alt"):
+            return 0.0
+        return max(-1.0, min(1.0, (sc.target_alt - ac.alt) / PITCH_FULL_ERROR))
+
+    # ------------------------------------------------------------ 조종 안내 (사람이 조종할 때)
+
+    @staticmethod
+    def _guide_alt(sc, ac):
+        """사람에게 안내할 목표 고도 (m). 안내할 고도가 없으면 None."""
+        if hasattr(sc, "target_alt"):
+            return sc.target_alt
+        if sc.name == "takeoff":
+            return sc.TARGET_ALT + 20.0 if ac.airborne else None
+        final = sc.name == "landing" or (sc.name == "circuit" and sc.idx >= sc.final_idx - 100)
+        if final:   # 접근 강하 경로
+            return max(GLIDE_SLOPE * (AIM_Y - ac.y), 0.0)
+        if sc.name == "circuit":
+            return PATTERN_ALT if sc.lifted else None
+        if sc.name in ("straight", "turn"):
+            return CRUISE_ALT
+        return None
+
+    def guidance(self, sc, ac):
+        """경로와 목표 고도를 지키려면 넣어야 할 (roll, pitch) 입력. 화면의 조종 안내 십자선용."""
+        alt = self._guide_alt(sc, ac)
+        pitch = 0.0 if alt is None else max(-1.0, min(1.0, (alt - ac.alt) / PITCH_FULL_ERROR))
+        return self._roll(sc, ac), pitch
 
     # ------------------------------------------------------------ 방향
 
@@ -94,4 +126,6 @@ class Autopilot:
             if sc.idx < sc.final_idx - 100:   # 최종 접근 1 km 전까지는 장주 고도 유지
                 return self._hold(ac, PATTERN_ALT)
             return self._approach(ac)
+        if hasattr(sc, "target_alt"):   # 피치로 고도를 맞추되, 많이 낮으면 추력을 더한다
+            return 75 if ac.alt < sc.target_alt - 25.0 else 50
         return self._hold(ac, CRUISE_ALT)

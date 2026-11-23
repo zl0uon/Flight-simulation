@@ -3,6 +3,7 @@
 사용 예
     python3 analyze.py                      # trials.csv -> results/
     python3 analyze.py --input trials.csv --outdir results --test auto
+    python3 analyze.py --track tracks/P001_*_route.csv   # 시도 하나의 비행 궤적을 그림으로
 
 분석 단위
 - 기술통계(평균 ± 표준편차)는 시도(trial) 단위.
@@ -30,7 +31,7 @@ METRICS = {
     "target_time_s": "Time to target (s)",
     "path_error_m": "Path error (m)",
 }
-SCENARIO_ORDER = ["takeoff", "straight", "turn", "landing", "circuit"]
+SCENARIO_ORDER = ["takeoff", "straight", "turn", "landing", "circuit", "route"]
 ALPHA = 0.05
 
 # 색: 모드마다 고정 순서로 배정 (필터링돼도 같은 모드는 항상 같은 색)
@@ -289,8 +290,57 @@ def landing_bar(rates, colors, path):
 
 # ---------------------------------------------------------------- main
 
+def plot_track(path: Path, outdir: Path) -> Path:
+    """시도 하나의 비행 궤적 파일(tracks 폴더)을 그림으로: 위에서 본 경로, 고도, 조종 입력."""
+    from flight_sim import SCENARIOS
+
+    tr = pd.read_csv(path)
+    name = path.stem.rsplit("_", 1)[-1]
+    fig, (top, alt, inp) = plt.subplots(1, 3, figsize=(16, 5))
+
+    if name in SCENARIOS:   # 목표 경로
+        for shape in SCENARIOS[name]().targets():
+            if shape[0] == "line":
+                top.plot(*zip(shape[1], shape[2]), color="#d0d", lw=3, alpha=0.5)
+            elif shape[0] == "path":
+                top.plot(*zip(*shape[1]), color="#d0d", lw=3, alpha=0.5)
+            elif shape[0] == "circle":
+                top.add_patch(plt.Circle(shape[1], shape[2], fill=False, color="#d0d", lw=3, alpha=0.5))
+    top.plot(tr["x_m"], tr["y_m"], color="#06c", lw=1.5)
+    top.plot(tr["x_m"].iloc[0], tr["y_m"].iloc[0], "o", color="#06c")
+    lost = tr[tr["hand"] == 0]
+    top.plot(lost["x_m"], lost["y_m"], ".", color="#d33", ms=4)
+    top.set_aspect("equal", adjustable="datalim")
+    top.set(title="Path from above (magenta = target, red = hand lost)", xlabel="East (m)",
+            ylabel="North (m)")
+
+    alt.plot(tr["t_s"], tr["alt_m"], color="#06c", label="altitude")
+    if tr["target_alt_m"].notna().any():
+        alt.plot(tr["t_s"], tr["target_alt_m"], color="#d0d", lw=3, alpha=0.5, label="target")
+    alt.set(title="Altitude", xlabel="Time (s)", ylabel="Altitude (m)")
+    alt.legend(frameon=False)
+
+    inp.plot(tr["t_s"], tr["roll_input"], color="#06c", lw=1, label="roll")
+    inp.plot(tr["t_s"], tr["pitch_input"], color="#e80", lw=1, label="pitch")
+    inp.plot(tr["t_s"], tr["throttle_pct"] / 100.0, color="#3a3", lw=1, label="throttle (0-1)")
+    inp.set(title="Control inputs", xlabel="Time (s)", ylim=(-1.1, 1.1))
+    inp.legend(frameon=False, ncol=3, loc="lower center")
+    for ax in (top, alt, inp):
+        style_axes(ax)
+
+    fig.suptitle(path.stem)
+    fig.tight_layout()
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = outdir / f"track_{path.stem}.png"
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="trials.csv 분석")
+    parser.add_argument("--track", type=Path, nargs="+", default=None,
+                        help="비행 궤적 파일(tracks/*.csv)을 그림으로 저장하고 끝낸다")
     parser.add_argument("--input", type=Path, default=Path(__file__).parent / "trials.csv")
     parser.add_argument("--outdir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--env", default=None,
@@ -298,6 +348,11 @@ def main():
     parser.add_argument("--test", choices=["auto", "t", "wilcoxon"], default="auto",
                         help="auto = 차이값 Shapiro-Wilk p >= 0.05면 t검정, 아니면 Wilcoxon")
     args = parser.parse_args()
+
+    if args.track:
+        for path in args.track:
+            print(f"궤적 그림 저장: {plot_track(path, args.outdir)}")
+        return
 
     if not args.input.exists():
         raise SystemExit(f"{args.input}이 없습니다. experiment.py로 먼저 데이터를 수집하세요.")

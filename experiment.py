@@ -21,6 +21,7 @@
     python3 experiment.py --participant P001 --scenario full
     python3 experiment.py --participant P002 --scenario landing --repeats 3
     python3 experiment.py --participant P003 --scenario circuit    # 이륙부터 착륙까지 이어서 비행
+    python3 experiment.py --participant P003 --scenario route      # 복잡한 경로 + 상승·강하 (500 m까지)
     python3 experiment.py --participant P004 --env rough           # 강한 바람과 난기류
     python3 experiment.py --participant P005 --env off             # 바람·물리 효과 없는 처음의 단순 모델
 
@@ -55,8 +56,10 @@
 
 import argparse
 import csv
+import math
 import random
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -67,9 +70,11 @@ import numpy as np
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
-from flight_sim import (DEFAULT_WIND_FROM, ENVIRONMENTS, SCENARIO_ORDER, SCENARIOS,
-                        Environment, FreeFlight)
+from flight_sim import (DEFAULT_WIND_FROM, ENVIRONMENTS, SCENARIO_ALL, SCENARIO_ORDER, SCENARIOS,
+                        Aircraft, Environment, FreeFlight)
 from autopilot import Autopilot
+import airway
+import cockpit as ck
 from cockpit import FlightEffects
 from hand_tracking import (FlightController, draw_hand, ensure_model, forbid_frame_saving)
 from view3d import WEATHERS, View, normalize_key, render
@@ -79,12 +84,14 @@ CONSENT_TEXT = """
                       실험 참여 동의 안내
 ==================================================================
 본 실험은 손 제스처로 가상 비행기를 조종하는 방식의 사용성을
-평가합니다. 이륙, 직선 비행, 원형 선회, 착륙 과제를 수행합니다.
+평가합니다. 이륙, 직선 비행, 원형 선회, 착륙, 복잡한 경로 비행(상승·강하 포함) 과제를 수행합니다.
 
 [수집하는 정보]
   - 익명 참가자 코드 ({participant})
   - 과제 수행 기록: 시작 시각, 반응 시간, 목표 도달 시간,
     경로 오차, 착륙 성공 여부, 손 인식 실패 비율
+  - 비행 궤적: 과제 수행 중 0.1초 간격의 기체 위치·고도·속도와 조종 입력 값
+    (숫자만 기록하며, 손 모양이나 영상은 포함되지 않습니다. tracks 폴더에 저장)
 
 [수집하지 않는 정보]
   - 이름, 연락처 등 개인을 식별할 수 있는 정보
@@ -118,10 +125,11 @@ CSV_FIELDS = [
     "wind_from_deg",        # 바람이 불어오는 방위 (바람이 없으면 빈칸)
     "lighting",             # day / night (시도가 끝난 시점의 화면)
     "weather",              # clear / cloudy / rain / storm / fog / snow (시도가 끝난 시점의 화면)
+    "alt_error_m",          # route 과제만: 목표 고도와의 평균 차이 (절댓값, 시간 가중 평균)
 ]
 # 나중에 추가한 열과, 그 열이 없던 예전 기록에 채울 값 (예전 기록은 단순 모델·낮 화면이었다)
 ADDED_FIELDS = {"environment": "off", "wind_speed_ms": 0.0, "wind_from_deg": "", "lighting": "day",
-                "weather": "clear"}
+                "weather": "clear", "alt_error_m": ""}
 
 PARTICIPANT_RE = re.compile(r"^[A-Za-z]{1,4}\d{1,4}$")   # 예: P001, S12
 READY_DELAY = (1.5, 3.5)   # GO 신호 전 무작위 대기 (초): 예측해서 미리 움직이는 것 방지
@@ -152,9 +160,31 @@ class GestureInput:
                                      args.pitch_deadzone, args.max_pitch, args.invert_pitch)
         self.start = time.monotonic()
         self.last_ts = -1
+        # 카메라 읽기와 손 인식은 별도 스레드에서 돈다. 화면은 카메라 속도(어두우면 15 fps까지 떨어진다)에
+        # 묶이지 않고 FRAME_SECONDS 간격으로 그려지고, 조종 입력은 가장 최근 인식 결과를 쓴다.
+        self._raw = FlightController(args.smooth, args.deadzone, args.max_roll,
+                                     args.pitch_deadzone, args.max_pitch, args.invert_pitch)
+        self._latest = None      # (미리보기 프레임, 손 인식 여부)
+        self._failed = False
+        self._stop = threading.Event()
+        self._next = self._last_read = time.monotonic()
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
 
-    def read(self):
-        """(미리보기 프레임, 손 인식 여부) 반환. 카메라 오류 시 None."""
+    FRAME_SECONDS = 1 / 60   # 화면을 그리는 최소 간격
+    INPUT_TAU = 0.08         # 조종 입력이 새 인식 결과를 따라가는 시간 상수 (s): 계단처럼 튀지 않게
+    FIRST_FRAME_TIMEOUT = 10.0
+
+    def _capture_loop(self):
+        while not self._stop.is_set():
+            got = self._capture()
+            if got is None:
+                self._failed = True
+                return
+            self._latest = got
+
+    def _capture(self):
+        """카메라 한 프레임을 읽어 손을 인식한다. (미리보기 프레임, 손 인식 여부), 카메라 오류 시 None."""
         ok, frame = self.cap.read()
         if not ok:
             return None
@@ -170,13 +200,46 @@ class GestureInput:
         if result.hand_landmarks:
             lms, side = result.hand_landmarks[0], result.handedness[0][0].category_name
             world = result.hand_world_landmarks[0] if result.hand_world_landmarks else None
-            self.ctrl.update(lms, side, w, h, world)
+            self._raw.update(lms, side, w, h, world)
             draw_hand(frame, lms, side)
             return frame, True
-        self.ctrl.reset()
+        self._raw.lost()
         return frame, False
 
+    def read(self):
+        """(미리보기 프레임, 손 인식 여부) 반환. 카메라 오류 시 None.
+
+        새 카메라 프레임을 기다리지 않고 가장 최근 것을 돌려준다. 조종 입력(self.ctrl)은
+        최근 인식 결과 쪽으로 부드럽게 따라간다.
+        """
+        deadline = time.monotonic() + self.FIRST_FRAME_TIMEOUT
+        while self._latest is None and not self._failed and time.monotonic() < deadline:
+            time.sleep(0.01)   # 첫 프레임을 기다린다
+        if self._failed or self._latest is None:
+            return None
+        delay = self._next - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        now = time.monotonic()
+        self._next = max(self._next + self.FRAME_SECONDS, now)
+        k = 1.0 - math.exp(-min(now - self._last_read, 0.1) / self.INPUT_TAU)
+        self._last_read = now
+        raw, ctrl = self._raw, self.ctrl
+        ctrl.roll += (raw.roll - ctrl.roll) * k
+        ctrl.pitch += (raw.pitch - ctrl.pitch) * k
+        ctrl.angle += (raw.angle - ctrl.angle) * k
+        ctrl.pitch_angle += (raw.pitch_angle - ctrl.pitch_angle) * k
+        ctrl.throttle = raw.throttle
+        ctrl._calib = raw._calib   # 화면에 "중립 재는 중" 표시용
+        return self._latest
+
+    def recenter(self):
+        """Z 키: 지금 손 자세를 중립으로 다시 잡는다."""
+        self._raw.recalibrate()
+
     def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
         self.landmarker.close()
         self.cap.release()
 
@@ -204,6 +267,7 @@ class AutoInput:
     def fly(self, sc, ac):
         """현재 상황을 보고 조종 입력을 정한다. 시도 루프가 프레임마다 부른다."""
         self.ctrl.roll, self.ctrl.throttle = self.pilot.control(sc, ac)
+        self.ctrl.pitch = self.pilot.pitch(sc, ac)
         self.ctrl.angle = self.ctrl.roll * self.ctrl.max_roll
 
     def new_trial(self):
@@ -259,6 +323,34 @@ def coast(ac, ctrl, dt, env=None):
     return None
 
 
+TRACK_SECONDS = 0.1   # 비행 궤적을 남기는 간격 (초)
+TRACK_FIELDS = ["t_s", "x_m", "y_m", "alt_m", "heading_deg", "speed_ms", "vs_ms", "bank_deg",
+                "roll_input", "pitch_input", "throttle_pct", "path_error_m", "target_alt_m", "hand"]
+
+
+def track_sample(t, sc, ac, ctrl, hand) -> dict:
+    """비행 궤적 표본 하나: 위치·자세·조종 입력. 웹캠 영상이나 손 좌표는 들어가지 않는다."""
+    target = getattr(sc, "target_alt", None)
+    return {"t_s": round(t, 2), "x_m": round(ac.x, 1), "y_m": round(ac.y, 1), "alt_m": round(ac.alt, 1),
+            "heading_deg": round(ac.heading % 360.0, 1), "speed_ms": round(ac.speed, 1),
+            "vs_ms": round(ac.vs, 2), "bank_deg": round(ac.bank, 1),
+            "roll_input": round(ctrl.roll, 3), "pitch_input": round(ctrl.pitch, 3),
+            "throttle_pct": ctrl.throttle, "path_error_m": round(sc.path_error(ac), 1),
+            "target_alt_m": "" if target is None else round(target, 1), "hand": int(bool(hand))}
+
+
+def save_track(folder: Path, row: dict, track: list) -> Path:
+    """시도 하나의 궤적을 CSV로 저장한다. 파일 이름으로 trials.csv의 행과 짝지을 수 있다."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (f"{row['participant_id']}_{row['session_id']}_"
+                     f"{int(row['trial_no']):03d}_{row['scenario']}.csv")
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TRACK_FIELDS)
+        writer.writeheader()
+        writer.writerows(track)
+    return path
+
+
 def run_trial(inp, name, info, rng):
     """시나리오 1회 수행. (CSV 행 또는 None, 중단 여부) 반환."""
     sc = SCENARIOS[name]()
@@ -270,11 +362,15 @@ def run_trial(inp, name, info, rng):
     if ENVIRONMENTS[info["env"]] is not None:
         env = Environment(info["env"], info["wind_from"], seed=rng.random())
     fx = FlightEffects(ac, ctrl, env, info.get("motion", True))   # 이륙·착륙 연출, 움직임 효과 (표시 전용)
+    # 조종 안내 십자선: 사람이 조종할 때만 (자동 조종은 안내가 필요 없다)
+    guide = Autopilot() if info.get("guide", True) and not hasattr(inp, "fly") else None
+    info["fd"] = None
+    track = info["track"] = []   # 비행 궤적 표본 (TRACK_SECONDS 간격)
 
     phase = "ready"
     ready_until = time.monotonic() + rng.uniform(*READY_DELAY)
     go_time = start_iso = base_roll = base_pitch = base_throttle = reaction = result_until = None
-    err_sum = run_time = 0.0
+    err_sum = alt_sum = run_time = 0.0
     frames = lost = 0
     t = 0.0
     last = time.monotonic()
@@ -307,7 +403,14 @@ def run_trial(inp, name, info, rng):
                     reaction = t
                 event = ac.step(ctrl.roll, ctrl.throttle, dt, env, ctrl.pitch)
                 sc.update(ac, event, t)
+                if guide is not None:
+                    want_roll, want_pitch = guide.guidance(sc, ac)
+                    info["fd"] = (want_roll - ctrl.roll, want_pitch - ctrl.pitch)
+                if not track or t - track[-1]["t_s"] >= TRACK_SECONDS:
+                    track.append(track_sample(t, sc, ac, ctrl, hand))
                 err_sum += sc.path_error(ac) * dt
+                if hasattr(sc, "alt_error"):
+                    alt_sum += abs(sc.alt_error(ac)) * dt
                 run_time += dt
                 frames += 1
                 lost += not hand
@@ -316,6 +419,8 @@ def run_trial(inp, name, info, rng):
                 if not sc.done and t >= sc.timeout:
                     sc.finish("timeout", "time limit")
                 if sc.done:
+                    info["fd"] = None
+                    track.append(track_sample(t, sc, ac, ctrl, hand))
                     phase = "result"
                     result_until = now + (RESULT_SECONDS if ac.airborne else ROLLOUT_SECONDS)
             elif phase == "result":
@@ -332,7 +437,7 @@ def run_trial(inp, name, info, rng):
                 quit_requested = True
                 break
             while _keys:
-                system_key(_keys.pop(), ac)
+                system_key(_keys.pop(), ac, inp)
     except KeyboardInterrupt:   # 터미널에서 Ctrl+C
         quit_requested = True
 
@@ -364,6 +469,7 @@ def run_trial(inp, name, info, rng):
         "wind_from_deg": env.wind_from if env is not None and env.wind_speed > 0 else "",
         "lighting": "night" if _view.night else "day",
         "weather": _view.weather,
+        "alt_error_m": fmt(alt_sum / run_time, 1) if hasattr(sc, "alt_error") and run_time > 0 else "",
     }
     return row, quit_requested
 
@@ -374,9 +480,12 @@ FREE_NOTICE_SECONDS = 5.0   # 접지 결과를 보여주는 시간
 FREE_TRAIL_POINTS = 2000    # 궤적은 최근 것만 남긴다 (약 10 km)
 
 
-def system_key(key, ac) -> bool:
-    """기체 계통 조작 키 (모든 비행 모드): F = 플랩 다음 단계, G = 착륙 장치 올림/내림."""
-    if key in (ord("f"), ord("F")):
+def system_key(key, ac, inp=None) -> bool:
+    """모든 비행 모드 공통 키: F = 플랩 다음 단계, G = 착륙 장치 올림/내림, Z = 손 중립 다시 잡기."""
+    if key in (ord("z"), ord("Z")):
+        if hasattr(inp, "recenter"):
+            inp.recenter()
+    elif key in (ord("f"), ord("F")):
         ac.next_flaps()
     elif key in (ord("g"), ord("G")):
         ac.toggle_gear()
@@ -460,7 +569,7 @@ def run_free(inp, info, rng):
             while _keys:
                 key = _keys.pop()
                 lower = key | 0x20 if 0 < key < 128 else key   # 대문자도 같은 키로
-                if system_key(key, ac):
+                if system_key(key, ac, inp):
                     pass
                 elif lower == ord("r"):   # 활주로 출발 위치에서 다시 시작 (고장도 풀린다)
                     sc, ac, env, fx, trail = start()
@@ -561,7 +670,7 @@ def ask_consent(participant: str, output: Path) -> bool:
 FLIGHT_MODES = {
     "staged": "단계별 시뮬레이션 - 이륙 → 직선 → 선회 → 착륙 과제를 차례로 수행 (실험 기록 저장)",
     "free": "자유 비행         - 과제 없이 손으로 자유롭게 비행 (기록 없음)",
-    "auto": "자동 조종         - 컴퓨터가 스스로 비행, 지켜보기 (카메라·기록 없음)",
+    "auto": "자동 조종         - 컴퓨터가 실제 항로(예: 인천 → 로스앤젤레스)를 비행, 지켜보기 (카메라·기록 없음)",
 }
 VIEW_HELP = ("화면 시점: 마우스 드래그·트랙패드 두 손가락 스크롤·방향키(또는 4 6 8 2) = 회전,\n"
              "           +/- 또는 Ctrl+스크롤 = 확대/축소,\n"
@@ -570,6 +679,7 @@ VIEW_HELP = ("화면 시점: 마우스 드래그·트랙패드 두 손가락 스
              "날씨 전환: W 키 또는 그 옆의 날씨 버튼 클릭\n"
              "조종석 시점: C 키 (뒤에서 따라가는 시점과 전환, 조종석에서는 드래그로 고개 돌리기)\n"
              "기체 계통: F = 플랩 다음 단계, G = 착륙 장치 올림/내림\n"
+             "손 중립 다시 잡기: 손을 편하게 든 자세에서 Z 키 (시작할 때 한 번은 자동으로 잡습니다)\n"
              "종료: 창의 닫기 버튼, q 또는 ESC\n")
 
 
@@ -615,6 +725,8 @@ def ask_weather() -> str:
             return names[int(answer) - 1]
         print(f"1~{len(names)} 중에서 골라 주세요.")
 
+
+BUNDLES = {"full": SCENARIO_ORDER, "all": SCENARIO_ALL}   # 여러 과제를 차례로 하는 묶음
 
 CAMS = {"pilot": "조종사 시점 (조종석에서 앞을 봄)", "outside": "외부 시점 (기체 뒤에서 따라가며 봄)"}
 
@@ -672,6 +784,161 @@ def close_window():
     cv2.waitKey(1)  # macOS에서 창이 실제로 닫히도록 이벤트 한 번 처리
 
 
+# ---------------------------------------------------------------- 손동작 연습과 결과 요약
+
+PRACTICE_HOLD = 1.0   # 동작을 이만큼(초) 유지하면 다음 단계로
+# (제목, 설명, 통과 조건). 화면 글자는 영어다 (OpenCV 기본 글꼴은 한글을 그리지 못함)
+PRACTICE_STEPS = [
+    ("HOLD YOUR HAND UP", "Open hand, relaxed, facing the camera. Keep it still.",
+     lambda c: not c.calibrating and abs(c.roll) < 0.15 and abs(c.pitch) < 0.3),
+    ("TILT RIGHT", "Lean your hand to the right: the aircraft turns right.", lambda c: c.roll > 0.6),
+    ("TILT LEFT", "Lean your hand to the left: the aircraft turns left.", lambda c: c.roll < -0.6),
+    ("TILT PALM BACK", "Fingertips toward you: the aircraft climbs.", lambda c: c.pitch > 0.5),
+    ("TILT PALM FORWARD", "Fingertips toward the camera: the aircraft descends.",
+     lambda c: c.pitch < -0.5),
+    ("MAKE A FIST", "No fingers = throttle 0%.", lambda c: c.throttle == 0),
+    ("SHOW 2 FINGERS", "Two fingers = throttle 50% (level flight).", lambda c: c.throttle == 50),
+    ("OPEN YOUR HAND", "Four or five fingers = throttle 100%.", lambda c: c.throttle == 100),
+]
+SKIP_STEP_KEYS = (32,)        # Space: 이 동작 건너뛰기
+SKIP_ALL_KEYS = (13, 10, 3)   # Enter: 연습 전체 건너뛰기
+
+
+def draw_practice(cam, hand, ctrl, step, hold, done):
+    """연습 화면: 왼쪽에 웹캠 미리보기(저장하지 않음), 오른쪽에 조종 입력, 아래에 지금 할 동작."""
+    img = np.full((ck.CANVAS_H, ck.CANVAS_W, 3), ck.PANEL, np.uint8)
+    ck.text(img, "HAND GESTURE PRACTICE", (24, 40), 0.9, ck.WHITE, 2)
+    ck.text(img, "NOT RECORDED", (ck.CANVAS_W - 24, 40), 0.5, ck.GRAY, 1, "r")
+    if cam is not None:
+        img[64:64 + 420, 24:24 + 560] = cv2.resize(cam, (560, 420), interpolation=cv2.INTER_AREA)
+    cv2.rectangle(img, (23, 63), (584, 484), ck.RED if not hand else ck.DIM, 2 if not hand else 1)
+    if not hand:
+        ck.text(img, "NO HAND - show your hand to the camera", (304, 474), 0.55, ck.WHITE, 2, "c")
+
+    x = 624   # 조종 입력 (오른쪽)
+    ck.draw_axis_input(img, x, 110, 340, "ROLL (tilt left / right)", ctrl.roll,
+                       ctrl.deadzone / ctrl.max_roll, ("L", "R"), hand)
+    ck.draw_axis_input(img, x, 190, 340, "PITCH (palm forward / back)", ctrl.pitch,
+                       ctrl.pitch_deadzone / ctrl.max_pitch, ("DN", "UP"), hand)
+    ck.draw_throttle(img, x, 272, 130, ctrl.throttle)
+    ck.text(img, "THROTTLE = number of fingers", (x + 90, 300), 0.45, ck.WHITE)
+    ck.text(img, "0 = 0%    1 = 25%    2 = 50%", (x + 90, 330), 0.42, ck.GRAY)
+    ck.text(img, "3 = 75%    4 or 5 = 100%", (x + 90, 352), 0.42, ck.GRAY)
+
+    for i, (title, _text, _ok) in enumerate(PRACTICE_STEPS):   # 단계 목록
+        col, row = divmod(i, 4)
+        color = ck.GREEN if i < step or done else ck.WHITE if i == step else ck.DIM
+        mark = "OK " if i < step or done else ">  " if i == step else "   "
+        ck.text(img, f"{mark}{i + 1}. {title}", (x + col * 185, 470 + row * 22), 0.4, color)
+
+    ck.shade(img, 24, 560, ck.CANVAS_W - 24, 660, (60, 50, 40), 0.9)   # 지금 할 동작 (아래)
+    cv2.rectangle(img, (24, 560), (ck.CANVAS_W - 24, 660), ck.DIM, 1)
+    if done:
+        ck.text(img, "PRACTICE COMPLETE", (ck.CANVAS_W // 2, 606), 1.0, ck.GREEN, 2, "c")
+        ck.text(img, "The first task starts now.", (ck.CANVAS_W // 2, 640), 0.55, ck.WHITE, 1, "c")
+    else:
+        title, text, _ok = PRACTICE_STEPS[step]
+        ck.text(img, f"{step + 1} / {len(PRACTICE_STEPS)}   {title}", (44, 598), 0.9, ck.WHITE, 2)
+        ck.text(img, text, (44, 630), 0.55, ck.WHITE)
+        cv2.rectangle(img, (44, 642), (ck.CANVAS_W - 44, 650), (70, 70, 70), -1)   # 유지 시간 막대
+        cv2.rectangle(img, (44, 642), (44 + int((ck.CANVAS_W - 88) * min(hold / PRACTICE_HOLD, 1.0)), 650),
+                      ck.GREEN, -1)
+    ck.text(img, "SPACE: skip this step    ENTER: skip practice    Z: recenter hand    Q: quit",
+            (ck.CANVAS_W // 2, 686), 0.42, ck.GRAY, 1, "c")
+    return img
+
+
+def run_practice(inp) -> bool:
+    """기록 없이 손동작을 하나씩 따라 해 본다. 끝까지 했거나 건너뛰면 True, 종료를 원하면 False."""
+    ctrl = inp.ctrl
+    step, hold, done_until = 0, 0.0, None
+    last = time.monotonic()
+    try:
+        while True:
+            got = inp.read()
+            if got is None:
+                print("프레임을 읽지 못했습니다.")
+                return False
+            cam, hand = got
+            now = time.monotonic()
+            dt, last = min(now - last, 0.1), now
+            if done_until is None:
+                ok = hand and PRACTICE_STEPS[step][2](ctrl)
+                hold = hold + dt if ok else 0.0
+                if hold >= PRACTICE_HOLD:
+                    step, hold = step + 1, 0.0
+            elif now >= done_until:
+                return True
+            cv2.imshow(WINDOW_NAME, draw_practice(cam, hand, ctrl, min(step, len(PRACTICE_STEPS) - 1),
+                                                  hold, done_until is not None))
+            if user_wants_quit():
+                return False
+            while _keys:
+                key = _keys.pop()
+                if key in SKIP_ALL_KEYS:
+                    return True
+                if key in SKIP_STEP_KEYS and done_until is None:
+                    step, hold = step + 1, 0.0
+                elif key in (ord("z"), ord("Z")) and hasattr(inp, "recenter"):
+                    inp.recenter()
+            if step >= len(PRACTICE_STEPS) and done_until is None:
+                done_until = now + 1.5
+    except KeyboardInterrupt:
+        return False
+
+
+OUTCOME_COLORS = {"success": ck.GREEN, "fail": ck.RED, "timeout": ck.AMBER}
+
+
+def draw_summary(rows, info):
+    """모든 과제를 마친 뒤의 결과 요약표."""
+    img = np.full((ck.CANVAS_H, ck.CANVAS_W, 3), ck.PANEL, np.uint8)
+    ck.text(img, "SESSION SUMMARY", (40, 56), 1.0, ck.WHITE, 2)
+    ck.text(img, f"{info['participant']}   {str(info['mode']).upper()} CONTROL", (ck.CANVAS_W - 40, 56),
+            0.55, ck.GRAY, 1, "r")
+    cols = [("STAGE", 40, "l"), ("RESULT", 250, "l"), ("TIME s", 500, "r"), ("REACTION s", 630, "r"),
+            ("PATH ERR m", 770, "r"), ("ALT ERR m", 900, "r")]
+    for label, x, anchor in cols:
+        ck.text(img, label, (x, 110), 0.5, ck.GRAY, 1, anchor)
+    cv2.line(img, (40, 122), (ck.CANVAS_W - 40, 122), ck.DIM, 1)
+    shown = rows[-13:]   # 화면에 들어가는 만큼만 (반복이 많을 때는 최근 것)
+    blank = lambda v: "-" if v in ("", None) else str(v)
+    for i, row in enumerate(shown):
+        y = 156 + i * 34
+        ck.text(img, f"{row['trial_no']}. {row['scenario'].upper()}", (40, y), 0.6, ck.WHITE, 1)
+        ck.text(img, row["outcome"].upper(), (250, y), 0.6, OUTCOME_COLORS.get(row["outcome"], ck.GRAY), 2)
+        for key, x in (("target_time_s", 500), ("reaction_time_s", 630), ("path_error_m", 770),
+                       ("alt_error_m", 900)):
+            ck.text(img, blank(row[key]), (x, y), 0.6, ck.WHITE, 1, "r")
+        if row["fail_reason"]:
+            ck.text(img, row["fail_reason"], (250, y + 15), 0.38, ck.GRAY)
+    wins = sum(row["outcome"] == "success" for row in rows)
+    y = 156 + len(shown) * 34 + 20
+    cv2.line(img, (40, y - 26), (ck.CANVAS_W - 40, y - 26), ck.DIM, 1)
+    ck.text(img, f"{wins} / {len(rows)} STAGES COMPLETED", (40, y + 8), 0.8,
+            ck.GREEN if wins == len(rows) else ck.WHITE, 2)
+    ck.text(img, "Press ENTER or SPACE, or close the window, to finish", (ck.CANVAS_W // 2, 676), 0.5,
+            ck.GRAY, 1, "c")
+    return img
+
+
+def show_summary(inp, rows, info):
+    """결과 요약표를 키를 누르거나 창을 닫을 때까지 보여준다."""
+    img = draw_summary(rows, info)
+    try:
+        while True:
+            if inp.read() is None:   # 화면 갱신 속도를 맞추는 용도 (영상은 쓰지 않는다)
+                return
+            cv2.imshow(WINDOW_NAME, img)
+            if user_wants_quit():
+                return
+            while _keys:
+                if _keys.pop() in SKIP_STEP_KEYS + SKIP_ALL_KEYS:
+                    return
+    except KeyboardInterrupt:
+        return
+
+
 def main_staged(args, parser):
     """단계별 시뮬레이션: 참가자 코드와 동의를 받고 과제를 차례로 수행해 기록한다."""
     if args.participant is None:
@@ -679,8 +946,8 @@ def main_staged(args, parser):
     elif not PARTICIPANT_RE.match(args.participant):
         parser.error(PARTICIPANT_HELP)
 
-    name = args.scenario or "full"
-    scenarios = (SCENARIO_ORDER if name == "full" else [name]) * (args.repeats or 1)
+    name = args.scenario or "all"   # 기본: 기본 과제 4개에 이어 복잡한 경로까지
+    scenarios = BUNDLES.get(name, [name]) * (args.repeats or 1)
     rng = random.Random(args.seed)
     info = {
         "participant": args.participant.upper(),
@@ -689,6 +956,7 @@ def main_staged(args, parser):
         "env": args.env,
         "wind_from": args.wind_from,
         "motion": not args.no_motion,
+        "guide": not args.no_guide,
     }
     if not ask_consent(info["participant"], args.output):
         print("동의하지 않아 실험을 시작하지 않습니다. 카메라는 켜지지 않았고 기록도 남지 않았습니다.")
@@ -701,23 +969,35 @@ def main_staged(args, parser):
     trial_no = next_trial_no(args.output, info["participant"])
     inp = MODES[args.mode](args)
     saved = 0
+    rows = []
+    track_dir = args.output.parent / "tracks"
     try:
         open_window()
+        quit_requested = args.practice and not run_practice(inp)
         for name in scenarios:
+            if quit_requested:
+                break
             info["trial_no"] = trial_no
             row, quit_requested = run_trial(inp, name, info, rng)
             if row is not None:
                 append_row(args.output, row)
+                if not args.no_tracks and info["track"]:
+                    save_track(track_dir, row, info["track"])
+                rows.append(row)
                 saved += 1
                 trial_no += 1
                 print(f"[{row['scenario']}] {row['outcome']}  RT={row['reaction_time_s']}s  "
                       f"time={row['target_time_s']}s  err={row['path_error_m']}m")
             if quit_requested:
                 break
+        if rows and not quit_requested:
+            show_summary(inp, rows, info)
     finally:
         inp.close()
         close_window()
     print(f"{saved}개 시도를 {args.output}에 저장했습니다.")
+    if saved and not args.no_tracks:
+        print(f"비행 궤적은 {track_dir} 폴더에 시도별 파일로 저장했습니다.")
 
 
 def main_free(args):
@@ -725,7 +1005,7 @@ def main_free(args):
     print("자유 비행 모드입니다. 과제나 판정 없이 자유롭게 비행합니다.")
     print("웹캠 영상은 손 인식을 위해 메모리에서만 처리되며 저장되지 않습니다. 비행 기록도 남기지 않습니다.")
     print("교관석 기능 (키): P = 일시 정지,  X = 엔진 고장 걸기/풀기,  T = 강한 돌풍 주입\n"
-          "                  R = 활주로에서 다시 시작,  A = 최종 접근 3 km 지점,  H = 공항 상공 300 m\n")
+          "                  R = 활주로에서 다시 시작,  L = 최종 접근 3 km 지점,  H = 공항 상공 300 m\n")
     print(VIEW_HELP)
     print_environment(args)
     info = {"participant": "FREE FLIGHT", "mode": args.mode, "subtitle": "NOT RECORDED",
@@ -742,10 +1022,262 @@ def main_free(args):
     print(f"자유 비행을 마쳤습니다 (착륙 {landings}회). 기록은 저장하지 않았습니다.")
 
 
+# ---------------------------------------------------------------- 실제 항로 비행 (자동 조종)
+
+ENROUTE_LOW_ALT = 150.0        # 이 고도까지는 화면도 실제 고도 그대로 그린다 (m)
+ENROUTE_ALT_SCALE = 0.051      # 그 위로는 화면의 고도를 줄여 그린다 (10,700 m -> 약 690 m)
+ENROUTE_BLEND_SECONDS = 1.5    # 해안을 지날 때 바다와 육지가 바뀌는 데 걸리는 시간
+
+
+class EnrouteView:
+    """순항 구간의 화면 표시용 정보 (왼쪽 위 상자). 과제 판정은 없다."""
+    timeout = None
+    error_label = "DIST TO GO"
+    instruction = ""
+    reason = ""
+    touchdown = outcome = None
+    done = False
+
+    def __init__(self, route):
+        self.route = route
+        self.name = f"{route.origin} > {route.dest}"
+        self.km = 0.0            # 지나온 거리
+        self.elapsed = 0.0       # 실제 기준 비행 시간 (초)
+
+    @property
+    def progress(self):
+        return min(self.km / self.route.distance, 1.0)
+
+    @property
+    def time_text(self):
+        return airway.format_hm(self.elapsed)
+
+    def error_text(self, ac):
+        return f"{max(self.route.distance - self.km, 0.0):,.0f} km"
+
+    def path_error(self, ac):
+        return 0.0
+
+    def targets(self):
+        return []
+
+
+GUIDE_AHEAD = 14000.0   # 순항 화면에서 길 안내선을 그리는 거리 (화면 기준 m)
+GUIDE_STEP = 500.0
+
+
+def guide_path(route, km, ac, visual):
+    """순항 화면의 길 안내선: 지금 위치에서 앞으로 이어지는 항로 (화면 좌표, 기체보다 조금 아래).
+
+    화면은 축소해서 그리므로, 화면의 거리를 실제 거리로 바꿔 그 지점의 진행 방위를 따라 이어 간다.
+    """
+    real_per_visual = ac.alt / max(visual.alt, 1.0)   # 화면 1 m가 실제 몇 m인지
+    z = visual.alt - 60.0   # 조종사 시점에서도 앞으로 뻗은 선으로 보이도록 기체보다 충분히 아래에 둔다
+    x, y = visual.x, visual.y
+    pts = [(x, y, z)]
+    for i in range(int(GUIDE_AHEAD / GUIDE_STEP)):
+        ahead_km = km + (i + 0.5) * GUIDE_STEP * real_per_visual / 1000.0
+        if ahead_km >= route.distance:
+            break
+        h = math.radians(route.bearing(ahead_km / route.distance))
+        x, y = x + GUIDE_STEP * math.sin(h), y + GUIDE_STEP * math.cos(h)
+        pts.append((x, y, z))
+    return pts
+
+
+def run_enroute(inp, route, maps, info, rng) -> bool:
+    """순항 구간: 대권 항로를 따라 실제 고도·속도로 날되 시간을 압축해 보여준다. 중단을 원하면 True.
+
+    기체 상태(ac)는 실제 값(고도 10 km, 속도 250 m/s)이고 계기도 그 값을 보인다. 3D 화면은 고도를
+    줄인 별도의 기체(visual)로 그린다: 실제 축척으로는 지면이 전부 안개에 묻혀 보이지 않기 때문이다.
+    """
+    sc = EnrouteView(route)
+    ctrl = inp.ctrl
+    ctrl.roll = ctrl.pitch = 0.0
+    total = route.flight_seconds
+    warp = total / route.show_seconds
+    env = None
+    if ENVIRONMENTS[info["env"]] is not None:
+        env = Environment(info["env"], info["wind_from"], seed=rng.random())
+    ac = Aircraft(x=0.0, y=0.0, heading=route.bearing(0.0), speed=route.airspeed(0.0),
+                  alt=route.altitude(0.0), airborne=True)
+    ac.physical = True
+    visual = Aircraft(x=0.0, y=0.0, heading=ac.heading, speed=ac.speed, alt=ac.alt, airborne=True)
+    fx = FlightEffects(ac, ctrl, env, info.get("motion", True))
+    land = 1.0
+    hint = info.get("hint")
+    info["hint"] = f"CRUISE TIME x{warp:.0f}"
+    last = time.monotonic()
+    quit_requested = False
+    try:
+        while sc.km < route.distance:
+            if inp.read() is None:
+                quit_requested = True
+                break
+            now = time.monotonic()
+            dt, last = min(now - last, 0.1), now
+            # 이번 프레임에 흐른 실제 시간. 상승·강하 구간은 천천히 보여준다 (순항의 1/5 속도에서 시작)
+            sim_dt = dt * warp * (0.2 + 0.8 * route.climb_progress(sc.km))
+            sc.km = min(sc.km + route.ground_speed(sc.km) * sim_dt / 1000.0, route.distance)
+            sc.elapsed += sim_dt
+            frac = sc.progress
+            new_alt = route.altitude(sc.km)
+            ac.vs = (new_alt - ac.alt) / sim_dt if sim_dt > 0 else 0.0
+            ac.alt, ac.speed = new_alt, route.airspeed(sc.km)
+            ac.ground_speed = route.ground_speed(sc.km)
+            ac.heading = route.bearing(frac)
+            ctrl.throttle = 75 if ac.vs > 1.0 else 25 if ac.vs < -1.0 else 50
+            if env is not None:
+                env.step(min(ac.alt, 500.0), dt)
+            # 화면용 기체: 고도를 줄이고, 지면이 흐르는 속도도 같은 비율로 줄인다
+            visual.alt = min(ac.alt, ENROUTE_LOW_ALT + (ac.alt - ENROUTE_LOW_ALT) * ENROUTE_ALT_SCALE)
+            step = ac.ground_speed * (visual.alt / ac.alt) * dt
+            h = math.radians(ac.heading)
+            visual.x, visual.y = visual.x + step * math.sin(h), visual.y + step * math.cos(h)
+            visual.heading, visual.speed = ac.heading, ac.speed
+            # 공항 근처는 항상 육지로 본다 (거친 해안선으로는 바닷가 공항이 바다 위로 판정되기도 한다)
+            near_airport = min(sc.km, route.distance - sc.km) < 40.0
+            target = 1.0 if near_airport or airway.over_land(*route.position(frac)) else 0.0
+            land += (target - land) * min(dt / ENROUTE_BLEND_SECONDS, 1.0)
+            info["airway"] = {"map": maps[0], "minimap": maps[1], "frac": frac, "land": land,
+                              "visual": visual, "guide": guide_path(route, sc.km, ac, visual),
+                              "banner": f"TO {route.dest}   {route.distance - sc.km:,.0f} km   "
+                                        f"{airway.format_hm(max(total - sc.elapsed, 0.0))} LEFT"}
+            fx.update(ac, ctrl, None, dt)
+            cv2.imshow(WINDOW_NAME,
+                       render(_view, sc, ac, [], ctrl, None, True, "run", sc.elapsed, info, fx))
+            if user_wants_quit():
+                quit_requested = True
+                break
+            _keys.clear()
+    except KeyboardInterrupt:
+        quit_requested = True
+    info["airway"] = None
+    info["hint"] = hint
+    return quit_requested
+
+
+def ask_airport(prompt, exclude=None) -> str:
+    """터미널에서 실제 공항 하나를 고르게 한다.
+
+    자주 쓰는 공항은 번호로, 그 밖의 전 세계 공항은 공항 코드(LHR 등)나 도시 이름 검색(paris 등)으로 고른다.
+    """
+    shown = [c for c in airway.KOREAN_NAMES if c != exclude and c in airway.AIRPORTS]
+    describe = lambda c: f"{c} {airway.AIRPORTS[c][3]}"
+    print(prompt)
+    for i in range(0, len(shown), 3):   # 세 칸씩 나눠서 보여준다
+        print("  " + "".join(f"{k + 1:2d}) {describe(shown[k]):<18}" for k in range(i, min(i + 3, len(shown)))))
+    print(f"  이 밖의 공항(전 세계 {len(airway.AIRPORTS):,}곳)은 공항 코드(예: AMS)나 영문 도시 이름(예: paris)을 입력하세요.")
+    while True:
+        try:
+            answer = input("번호, 공항 코드 또는 도시 이름: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\n공항을 고르지 않아 시작하지 않습니다.")
+        if answer.isdigit():
+            if 1 <= int(answer) <= len(shown):
+                return shown[int(answer) - 1]
+            print(f"번호는 1~{len(shown)} 사이입니다.")
+            continue
+        code = answer.upper()
+        if code in airway.AIRPORTS and code != exclude:
+            return code
+        if len(answer) < 2:
+            continue
+        found = [c for c in airway.search_airports(answer) if c != exclude]
+        if not found:
+            print("찾지 못했습니다. 영문 도시 이름이나 세 글자 공항 코드를 입력해 주세요.")
+        elif len(found) == 1:
+            return found[0]
+        else:   # 여러 개면 목록을 바꿔서 다시 고르게 한다
+            shown = found
+            print("검색 결과:")
+            for k, c in enumerate(shown, 1):
+                print(f"  {k:2d}) {c} {airway.AIRPORTS[c][6]} ({airway.AIRPORTS[c][4]}, {airway.AIRPORTS[c][5]})")
+
+
+def airport_code(text) -> str:
+    """명령행의 공항 코드 확인."""
+    code = text.upper()
+    if code not in airway.AIRPORTS:
+        raise argparse.ArgumentTypeError(f"{text!r}는 모르는 공항 코드입니다 (예: ICN, LAX, LHR)")
+    return code
+
+
+def ask_route(origin=None, dest=None):
+    """출발 공항과 도착 공항을 차례로 정해 항로를 만든다. 너무 가까운 두 공항이면 다시 고르게 한다."""
+    asked = origin is None or dest is None
+    while True:
+        a = origin or ask_airport("\n출발 공항을 고르세요")
+        print(f"출발: {airway.AIRPORTS[a][3]} ({a})")
+        b = dest or ask_airport("\n도착 공항을 고르세요", exclude=a)
+        print(f"도착: {airway.AIRPORTS[b][3]} ({b})")
+        route = airway.Route(a, b) if a != b else None
+        if route is not None and route.distance >= airway.MIN_DISTANCE:
+            return route
+        message = (f"두 공항이 너무 가깝습니다 ({airway.MIN_DISTANCE:.0f} km 이상 떨어진 공항을 골라 주세요)."
+                   if route is not None else "출발 공항과 도착 공항이 같습니다.")
+        if not asked:
+            raise SystemExit(message)
+        print(message)
+        origin = dest = None
+
+
+def main_airway(args):
+    """자동 조종 - 실제 항로 비행: 출발 공항 이륙 -> 순항(시간 압축) -> 도착 공항 착륙."""
+    route = ask_route(args.origin, args.dest)
+    origin, dest = airway.AIRPORTS[route.origin][0], airway.AIRPORTS[route.dest][0]
+    print("자동 조종 모드입니다. 컴퓨터가 실제 항로를 따라 스스로 비행합니다. 카메라는 켜지 않고 기록도 남기지 않습니다.")
+    print(f"항로: {route.label}")
+    print(f"  거리 {route.distance:,.0f} km, 순항 고도 {route.cruise_alt:,.0f} m, "
+          f"실제 비행 시간 약 {airway.format_hm(route.flight_seconds)} "
+          f"(화면에서는 약 {route.show_seconds:.0f}초로 압축)")
+    print("  V 키: 3D 화면 <-> 항로 지도\n")
+    print(VIEW_HELP)
+    print_environment(args)
+    info = {"participant": "AUTOPILOT", "mode": "auto", "subtitle": f"{route.origin} > {route.dest}   NOT RECORDED",
+            "session_id": "", "trial_label": "FLIGHT", "autopilot": True, "airway": None,
+            "env": args.env, "wind_from": args.wind_from, "motion": not args.no_motion}
+    maps = (airway.RouteMap(route, ck.MAP_W, ck.CANVAS_H), airway.RouteMap(route, 170, 170, labels=False))
+    rng = random.Random(args.seed)
+    inp = AutoInput(args)
+    flights = 0
+    try:
+        open_window()
+        quit_requested = False
+        while not quit_requested and (args.repeats is None or flights < args.repeats):
+            flights += 1
+            info["trial_no"] = flights
+            inp.new_trial()
+            print(f"[항로 비행 {flights}] {origin} 이륙")
+            info["hint"] = f"DEPARTURE: {origin} ({route.origin})"
+            row, quit_requested = run_trial(inp, "takeoff", info, rng)
+            if quit_requested or row is None or row["outcome"] != "success":
+                continue
+            print(f"[항로 비행 {flights}] 순항 시작")
+            quit_requested = run_enroute(inp, route, maps, info, rng)
+            if quit_requested:
+                break
+            inp.new_trial()
+            print(f"[항로 비행 {flights}] {dest} 접근")
+            info["hint"] = f"ARRIVAL: {dest} ({route.dest})"
+            row, quit_requested = run_trial(inp, "landing", info, rng)
+            if row is not None and row["outcome"] != "aborted":
+                print(f"[항로 비행 {flights}] {dest} 착륙: {row['outcome']}  {row['fail_reason']}")
+    finally:
+        inp.close()
+        close_window()
+    print("자동 조종을 마쳤습니다. 기록은 저장하지 않았습니다.")
+
+
 def main_auto(args):
-    """자동 조종: 컴퓨터가 과제를 수행하는 모습을 보여준다. 카메라도 기록도 쓰지 않는다."""
-    name = args.scenario or "circuit"
-    scenarios = SCENARIO_ORDER if name == "full" else [name]
+    """자동 조종: 컴퓨터가 비행하는 모습을 보여준다. 카메라도 기록도 쓰지 않는다.
+
+    기본은 실제 항로 비행(main_airway). --scenario 를 주면 그 과제를 자동 조종으로 수행한다.
+    """
+    if args.scenario is None:
+        return main_airway(args)
+    name = args.scenario
+    scenarios = BUNDLES.get(name, [name])
     print("자동 조종 모드입니다. 컴퓨터가 스스로 비행합니다. 카메라는 켜지 않고 기록도 남기지 않습니다.")
     print(f"과제: {' → '.join(scenarios)}" + ("" if args.repeats else "  (창을 닫을 때까지 반복)") + "\n")
     print(VIEW_HELP)
@@ -785,10 +1317,17 @@ def main():
                         help="익명 참가자 코드 (예: P001). 이름 등 실명 정보는 넣지 마세요. "
                              "단계별 시뮬레이션에서만 쓰며, 생략하면 실행 후 입력받습니다.")
     parser.add_argument("--mode", choices=sorted(MODES), default="gesture", help="조종 입력 방식")
-    parser.add_argument("--scenario", choices=list(SCENARIOS) + ["full"], default=None,
+    parser.add_argument("--scenario", choices=list(SCENARIOS) + list(BUNDLES), default=None,
                         help="full = 이륙 -> 직선 비행 -> 원형 선회 -> 착륙 순서로 진행. "
+                             "route = 좌우 선회가 이어지는 복잡한 경로를 따라 500 m까지 올라갔다 내려온다. "
+                             "all = full 다음 단계로 route까지 (단계별 모드의 기본). "
                              "circuit = 이륙부터 착륙까지 한 번에 이어서 비행. "
-                             "기본값: 단계별은 full, 자동 조종은 circuit (자유 비행은 과제 없음)")
+                             "기본값: 단계별은 all. 자동 조종은 생략하면 실제 항로 비행(--from, --to), "
+                             "주면 그 과제를 자동 조종으로 수행 (자유 비행은 과제 없음)")
+    parser.add_argument("--from", dest="origin", type=airport_code, default=None, metavar="공항코드",
+                        help="자동 조종 항로 비행의 출발 공항 (세 글자 IATA 코드, 예: ICN). 생략하면 실행 후 고릅니다")
+    parser.add_argument("--to", dest="dest", type=airport_code, default=None, metavar="공항코드",
+                        help="자동 조종 항로 비행의 도착 공항 (예: LAX). 생략하면 실행 후 고릅니다")
     parser.add_argument("--repeats", type=int, default=None,
                         help="시나리오(또는 full 묶음) 반복 횟수. 기본값: 단계별 1회, 자동 조종은 계속 반복")
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "trials.csv")
@@ -809,15 +1348,23 @@ def main():
                         help="시점: pilot = 조종사 시점, outside = 외부 시점. 생략하면 실행 후 고릅니다 "
                              "(실행 중 A 키나 화면 위 버튼으로도 전환)")
     parser.add_argument("--cockpit", action="store_true", help="--cam pilot 과 같다")
+    parser.add_argument("--practice", action="store_true",
+                        help="단계별 모드 맨 앞에 손동작 연습 화면을 넣는다 (기본은 바로 과제 시작)")
+    parser.add_argument("--no-tracks", action="store_true",
+                        help="시도별 비행 궤적 파일(tracks 폴더)을 저장하지 않는다")
+    parser.add_argument("--no-guide", action="store_true",
+                        help="조종 안내 십자선(자세계와 조종석 앞 유리의 마젠타 십자)을 끈다")
     parser.add_argument("--no-motion", action="store_true",
                         help="움직임 효과(가속·난기류·접지 때의 화면 흔들림)를 끈다")
     parser.add_argument("--view", choices=["3d", "2d"], default="3d",
                         help="시작 화면: 3d = 3D 추적 화면, 2d = 위에서 본 지도 (실행 중 V 키로 전환)")
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--min-confidence", type=float, default=0.3,
+                        help="손 인식 신뢰도 기준. 낮출수록 기울인 손도 덜 놓치지만 오인식이 늘 수 있다")
     parser.add_argument("--smooth", type=int, default=5)
     parser.add_argument("--deadzone", type=float, default=5.0)
-    parser.add_argument("--max-roll", type=float, default=45.0)
+    parser.add_argument("--max-roll", type=float, default=30.0,
+                        help="roll이 최대가 되는 손 기울기(도). 작을수록 덜 기울여도 크게 돈다")
     parser.add_argument("--pitch-deadzone", type=float, default=10.0,
                         help="손바닥 앞뒤 기울기의 중립 범위(도)")
     parser.add_argument("--max-pitch", type=float, default=40.0,

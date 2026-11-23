@@ -43,6 +43,7 @@ YELLOW = (0, 230, 255)
 SKY = (214, 140, 52)
 EARTH = (36, 78, 128)
 ASPHALT = (54, 52, 52)
+ROADWAY = (70, 68, 68)   # 공항 도로
 TAXIWAY = (84, 82, 80)
 
 MAX_BANK_DEG = 30.0      # roll 입력 ±1일 때 자세계에 표시하는 뱅크 각
@@ -154,7 +155,31 @@ def _stamp(img, s, center, size, color, flip=False):
     roi[:] = (roi * (1 - a) + np.array(color, np.float32) * a).astype(np.uint8)
 
 
-def draw_airport(m, to_s, s):
+CONCRETE = (150, 152, 154)     # 계류장 콘크리트
+MOWN = (64, 118, 76)           # 활주로 주변의 깎은 잔디
+TAXI_YELLOW = (0, 190, 230)
+# 주기 중인 여객기: (x, y, 기수 방위). 탑승구 3대 + 격납고 앞 1대
+PARKED = [(-316.0, 400.0, 270.0), (-316.0, 500.0, 270.0), (-316.0, 620.0, 270.0), (-262.0, 232.0, 90.0)]
+# 공항 건물 상자: (x1, y1, x2, y2, 높이, 벽 색, 지붕 색). 3D 화면이 입체로 세운다 (2번은 관제탑이어야 한다)
+AIRPORT_BUILDINGS = [
+    (-392, 380, -340, 640, 16.0, (178, 150, 112), (206, 206, 200)),   # 터미널 본관
+    (-340, 440, -296, 460, 9.0, (172, 146, 110), (198, 198, 194)),    # 탑승동 1
+    (-349, 663, -341, 671, 46.0, (186, 184, 180), (96, 116, 136)),    # 관제탑
+    (-340, 560, -296, 580, 9.0, (172, 146, 110), (198, 198, 194)),    # 탑승동 2
+    (-362, 650, -328, 684, 8.0, (160, 158, 154), (112, 110, 108)),    # 관제탑 아래 청사
+    (-400, 180, -330, 282, 17.0, (150, 156, 162), (170, 176, 182)),   # 정비 격납고
+    (-400, 70, -340, 160, 15.0, (144, 150, 158), (160, 166, 174)),    # 격납고 2
+    (-400, 300, -350, 362, 11.0, (136, 140, 150), (110, 120, 150)),   # 화물 창고
+    (-210, 800, -176, 830, 7.0, (70, 80, 190), (60, 64, 150)),        # 소방대
+    (-396, 770, -374, 792, 11.0, (226, 226, 222), (206, 206, 202)),   # 급유 탱크
+    (-366, 770, -344, 792, 11.0, (226, 226, 222), (206, 206, 202)),
+    (-396, 802, -374, 824, 11.0, (226, 226, 222), (206, 206, 202)),
+    (-520, 430, -470, 500, 12.0, (150, 150, 146), (104, 104, 104)),   # 주차 건물
+]
+
+
+def draw_airport(m, to_s, s, planes=True):
+    """공항을 위에서 본 그림. planes=False면 주기 중인 여객기는 그림자만 (3D 화면이 입체로 세운다)."""
     hw, length = RUNWAY_HALF_WIDTH, RUNWAY_LENGTH
 
     def rect(x1, y1, x2, y2, color):
@@ -163,26 +188,103 @@ def draw_airport(m, to_s, s):
     def line(p1, p2, color, thick=1):
         cv2.line(m, to_s(p1), to_s(p2), color, thick, AA)
 
-    # 계류장과 건물
-    rect(-300, 380, -150, 620, TAXIWAY)
-    rect(-292, 440, -252, 560, (128, 124, 118))
-    rect(-286, 446, -258, 554, (150, 146, 140))
-    rect(-292, 584, -256, 612, (112, 108, 104))
-    for y in (470, 500, 530):   # 주기장 표시선
-        line((-240, y), (-200, y), (0, 190, 230))
+    def poly(pts, color):
+        cv2.fillPoly(m, [np.array([to_s(p) for p in pts], np.int32)], color, AA)
 
-    # 유도로
-    rect(-140, 0, -118, length, TAXIWAY)
-    for y in (20, 500, 980):
-        rect(-140, y - 11, -hw, y + 11, TAXIWAY)
-        line((-129, y), (-hw, y), (0, 190, 230))
-    line((-129, 0), (-129, length), (0, 190, 230))
-    rect(-150, 489, -140, 511, TAXIWAY)
+    px = lambda meters: max(1, int(round(meters * s)))   # 선 굵기 (m -> 픽셀)
+    fine = s >= 1.0                                      # 자세한 표시는 충분히 크게 그릴 때만
+
+    # 비행장 안쪽: 깎은 잔디 (줄무늬), 둘레 도로와 울타리
+    rect(-540, -140, 140, 1140, MOWN)
+    if fine:
+        for x in range(-540, 140, 24):
+            rect(x, -140, x + 12, 1140, (60, 112, 72))
+    rect(-540, -140, 140, -132, ROADWAY)
+    rect(-540, 1132, 140, 1140, ROADWAY)
+    rect(132, -140, 140, 1140, ROADWAY)
+    for a, b in (((-540, -140), (140, -140)), ((140, -140), (140, 1140)), ((140, 1140), (-540, 1140))):
+        line(a, b, (120, 124, 124))
+
+    # 진입 도로, 주차장과 주차된 차
+    rect(-540, 395, -402, 640, (92, 92, 94))
+    rect(-412, 300, -402, 720, ROADWAY)
+    rect(-540, 300, -402, 310, ROADWAY)
+    line((-407, 300), (-407, 720), (200, 200, 200))
+    if fine:
+        rng = np.random.default_rng(4)
+        car_colors = [(200, 200, 205), (60, 60, 64), (150, 40, 40), (40, 50, 150), (170, 170, 175), (90, 110, 120)]
+        for row_y in range(520, 632, 16):
+            line((-534, row_y - 3), (-420, row_y - 3), (150, 150, 150))
+            for car_x in np.arange(-532.0, -422.0, 3.4):
+                if rng.random() < 0.7:
+                    rect(car_x, row_y, car_x + 2.2, row_y + 4.6, car_colors[rng.integers(len(car_colors))])
+
+    # 계류장: 콘크리트 판 줄눈, 탑승구 유도선
+    rect(-402, 50, -150, 850, CONCRETE)
+    if fine:
+        for x in range(-390, -150, 20):
+            line((x, 50), (x, 850), (140, 142, 144))
+        for y in range(70, 850, 20):
+            line((-402, y), (-150, y), (140, 142, 144))
+    line((-200, 60), (-200, 840), TAXI_YELLOW, px(0.5))   # 계류장 유도선
+    for x, y, _heading in PARKED[:3]:
+        line((x - 16, y), (-200, y), TAXI_YELLOW, px(0.4))
+        rect(x - 22, y - 1, x - 21, y + 1, (40, 40, 220))    # 정지선
+    for y in (430, 470, 550, 590):                           # 탑승교
+        rect(-322, y - 2, -296, y + 2, (190, 190, 186))
+    cv2.circle(m, to_s((-240, 760)), px(13), (130, 132, 134), -1, AA)   # 헬기장
+    cv2.circle(m, to_s((-240, 760)), px(13), (0, 200, 240), px(0.8), AA)
+    _stamp(m, "H", to_s((-240, 760)), float(np.clip(s * 0.5, 0.3, 2.0)), WHITE)
+
+    # 건물 지붕 (위에서 본 모습)
+    for x1, y1, x2, y2, _h, wall, roof in AIRPORT_BUILDINGS:
+        rect(x1, y1, x2, y2, wall)
+        rect(x1 + 2, y1 + 2, x2 - 2, y2 - 2, roof)
+    for x1, y1, x2, y2 in ((-396, 770, -374, 792), (-366, 770, -344, 792), (-396, 802, -374, 824)):
+        cv2.circle(m, to_s(((x1 + x2) / 2, (y1 + y2) / 2)), px(10), (232, 232, 228), -1, AA)
+
+    # 주기 중인 여객기
+    for x, y, heading in PARKED:
+        h = math.radians(heading)
+        rot = np.array([[math.cos(h), math.sin(h)], [-math.sin(h), math.cos(h)]])
+        shape = (_OUTLINE * 19.0) @ rot.T
+        if planes:
+            poly(shape + (x + 2, y - 3), (70, 72, 74))
+            poly(shape + (x, y), (240, 240, 240))
+        else:
+            poly(shape + (x + 1, y - 2), (84, 86, 88))
+
+    # 유도로: 평행 유도로와 연결 유도로, 가운데 노란 선, 활주로 앞 정지선
+    rect(-142, -10, -116, length + 10, TAXIWAY)
+    for y in (20, 250, 500, 750, 980):
+        rect(-142, y - 12, -hw, y + 12, TAXIWAY)
+        rect(-152, y - 12, -142, y + 12, TAXIWAY)
+        line((-150, y), (-hw, y), TAXI_YELLOW, px(0.4))
+        for d in (0.0, 1.2):
+            line((-62 - d, y - 11), (-62 - d, y + 11), TAXI_YELLOW, px(0.4))
+    line((-129, -6), (-129, length + 6), TAXI_YELLOW, px(0.4))
+
+    # 진입등 받침대가 서는 길 (활주로 양 끝 바깥)
+    rect(-2, -130, 2, -60, (96, 96, 96))
+    rect(-2, length + 60, 2, length + 130, (96, 96, 96))
 
     # 활주로 본체 (양 끝에 과주로)
+    rect(-hw - 6, -60, hw + 6, length + 60, (78, 76, 74))    # 갓길
     rect(-hw, -60, hw, 0, (66, 64, 62))
     rect(-hw, length, hw, length + 60, (66, 64, 62))
+    for end, sign in ((0, -1), (length, 1)):                 # 과주로의 노란 갈매기 무늬
+        for d in (12, 28, 44):
+            tip = end + sign * (d - 9)
+            for side in (-1, 1):
+                line((side * (hw - 2), end + sign * d), (0, tip), TAXI_YELLOW, px(0.9))
     rect(-hw, 0, hw, length, ASPHALT)
+    if fine:   # 접지대의 타이어 고무 자국
+        rng = np.random.default_rng(2)
+        for end, sign in ((0, 1), (length, -1)):
+            for _ in range(70):
+                x = float(rng.normal(0.0, 5.0)) + rng.choice((-4.5, 4.5))
+                y0 = end + sign * float(rng.uniform(140, 420))
+                line((x, y0), (x + rng.normal(0, 0.4), y0 + sign * float(rng.uniform(20, 90))), (40, 38, 38), 1)
     for x in (-hw + 1.5, hw - 1.5):
         line((x, 0), (x, length), WHITE)
 
@@ -224,8 +326,10 @@ def draw_targets(m, sc, to_s, s):
             pts = np.array([to_s(p) for p in shape[1]], np.int32)
             cv2.polylines(m, [pts], False, (110, 0, 110), 5, AA)
             cv2.polylines(m, [pts], False, MAGENTA, 2, AA)
-        elif shape[0] == "point":   # 웨이포인트 (네 갈래 별)
+        elif shape[0] in ("point", "gate"):   # 웨이포인트 (네 갈래 별). gate는 목표 고도도 적는다
             x, y = to_s(shape[1])
+            if shape[0] == "gate":
+                text(m, f"{shape[2]:.0f} m", (x + 16, y + 5), 0.45, WHITE, 1)
             star = np.array([(x, y - 13), (x + 4, y - 4), (x + 13, y), (x + 4, y + 4),
                              (x, y + 13), (x - 4, y + 4), (x - 13, y), (x - 4, y - 4)], np.int32)
             cv2.fillPoly(m, [star], MAGENTA, AA)
@@ -262,9 +366,13 @@ def _make_airport_lights():
         lights += [(x, y, white, 0.9) for x in (-3.0, 0.0, 3.0)]
     lights += [(x, -150.0, white, 0.9) for x in range(-18, 19, 6)]
     for y in range(0, int(length) + 1, 100):         # 유도로등 (파랑)
-        lights += [(-140.0, y, (255, 120, 40), 0.5), (-118.0, y, (255, 120, 40), 0.5)]
-    for y in (400, 460, 520, 580):                   # 계류장 조명
-        lights.append((-150.0, y, warm, 1.0))
+        lights += [(-142.0, y, (255, 120, 40), 0.5), (-116.0, y, (255, 120, 40), 0.5)]
+    for y in range(100, 841, 60):                    # 계류장 가장자리와 터미널 앞 조명
+        lights.append((-152.0, y, warm, 1.0))
+    for y in range(390, 641, 50):
+        lights.append((-338.0, y, warm, 1.2))
+    for x in range(-530, -419, 36):                  # 주차장 가로등
+        lights += [(x, 540.0, warm, 0.8), (x, 610.0, warm, 0.8)]
     return lights
 
 
@@ -377,7 +485,9 @@ def draw_overlays(m, sc, ac, phase, t, info, fx=None):
     if info.get("trial_no") is not None:
         text(m, f"{info.get('trial_label', 'TRIAL')} {info['trial_no']}", (282, 34), 0.5, GRAY, 1, "r")
     text(m, "TIME", (20, 60), 0.45, GRAY)
-    if sc.timeout is None:   # 자유 비행: 제한 시간 없음
+    if hasattr(sc, "time_text"):   # 항로 비행: 실제 기준 비행 시간
+        text(m, sc.time_text, (282, 60), 0.5, WHITE, 1, "r")
+    elif sc.timeout is None:   # 자유 비행: 제한 시간 없음
         text(m, f"{t:5.1f} s", (282, 60), 0.5, WHITE, 1, "r")
     else:
         text(m, f"{t:5.1f} / {sc.timeout:.0f} s", (282, 60), 0.5, WHITE, 1, "r")
@@ -385,7 +495,8 @@ def draw_overlays(m, sc, ac, phase, t, info, fx=None):
         cv2.rectangle(m, (20, 66), (282, 70), (70, 70, 70), -1)
         cv2.rectangle(m, (20, 66), (20 + int(262 * frac), 70), AMBER if frac > 0.8 else GREEN, -1)
     text(m, sc.error_label, (20, 88), 0.45, GRAY)
-    text(m, f"{sc.path_error(ac):6.1f} m", (282, 88), 0.5, MAGENTA, 1, "r")
+    err = sc.error_text(ac) if hasattr(sc, "error_text") else f"{sc.path_error(ac):6.1f} m"
+    text(m, err, (282, 88), 0.5, MAGENTA, 1, "r")
 
     if fx is not None:
         # 비행 단계 (정보 상자 아래)
@@ -448,7 +559,20 @@ def draw_overlays(m, sc, ac, phase, t, info, fx=None):
 
 # ---------------------------------------------------------------- 계기판
 
-def draw_adi(img, x, y, w, h, bank_deg, pitch_deg):
+FD_GAIN = 34   # 조종 안내 십자선: 입력 차이 1.0당 움직이는 픽셀
+
+
+def draw_fd(img, cx, cy, fd, reach=60, size=44):
+    """조종 안내 십자선(마젠타). 세로 막대가 오른쪽에 있으면 오른쪽으로 더 기울이고,
+    가로 막대가 위에 있으면 더 당긴다(상승). 둘을 가운데로 모으면 경로와 목표 고도를 지킨다."""
+    dx = int(np.clip(fd[0] * FD_GAIN, -reach, reach))
+    dy = int(np.clip(-fd[1] * FD_GAIN, -reach, reach))
+    for a, b in (((cx + dx, cy - size), (cx + dx, cy + size)), ((cx - size, cy + dy), (cx + size, cy + dy))):
+        cv2.line(img, a, b, (0, 0, 0), 5, AA)
+        cv2.line(img, a, b, MAGENTA, 3, AA)
+
+
+def draw_adi(img, x, y, w, h, bank_deg, pitch_deg, fd=None):
     """자세계(인공 수평선). 오른쪽으로 기울이면 수평선은 반시계 방향으로 돈다."""
     size = int(math.hypot(w, h)) + 40
     c = size // 2
@@ -482,6 +606,8 @@ def draw_adi(img, x, y, w, h, bank_deg, pitch_deg):
     img[y:y + h, x:x + w] = patch[c - h // 2:c - h // 2 + h, c - w // 2:c - w // 2 + w]
 
     cx, cy = x + w // 2, y + h // 2
+    if fd is not None:
+        draw_fd(img, cx, cy, fd)
     # 고정 뱅크 지침 (위쪽 삼각형)
     top = cy - r + 14
     cv2.fillPoly(img, [np.array([(cx, top), (cx - 6, top + 10), (cx + 6, top + 10)], np.int32)],
@@ -781,9 +907,9 @@ def draw_panel(img, sc, ac, ctrl, cam, hand, info, fx=None):
     py, ph = 56, 184
     bank, pitch = (fx.bank, fx.pitch) if fx is not None else attitude(ac, ctrl)
     draw_tape(img, x0 + 10, py, 54, ph, ac.speed, 4.0, 10, 5, True, bug=V_LEVEL)
-    draw_adi(img, x0 + 70, py, 156, ph, bank, pitch)
+    draw_adi(img, x0 + 70, py, 156, ph, bank, pitch, info.get("fd"))
     draw_tape(img, x0 + 232, py, 58, ph, ac.alt, 2.0, 20, 10, False,
-              bug=getattr(sc, "TARGET_ALT", None), ground=True)
+              bug=getattr(sc, "target_alt", getattr(sc, "TARGET_ALT", None)), ground=True)
     text(img, "SPD m/s", (x0 + 10, py + ph + 15), 0.38, GRAY)
     text(img, "ALT m", (CANVAS_W - 10, py + ph + 15), 0.38, GRAY, 1, "r")
 
@@ -802,7 +928,10 @@ def draw_panel(img, sc, ac, ctrl, cam, hand, info, fx=None):
         text(img, "NO CAMERA IN AUTOPILOT MODE", (x0 + 150, 606), 0.4, DIM, 1, "c")
     elif hand:
         cv2.rectangle(img, (x0 + 12, ay), (CANVAS_W - 12, ay + 22), (30, 70, 30), -1)
-        text(img, "HAND TRACKING", (x0 + 150, ay + 16), 0.45, GREEN, 1, "c")
+        if getattr(ctrl, "calibrating", False):   # 중립 자세를 재는 중
+            text(img, "CENTERING - HOLD HAND STILL", (x0 + 150, ay + 16), 0.42, AMBER, 1, "c")
+        else:
+            text(img, "HAND TRACKING   Z: RECENTER", (x0 + 150, ay + 16), 0.42, GREEN, 1, "c")
     else:
         on = int(time.monotonic() * 3) % 2 == 0
         cv2.rectangle(img, (x0 + 12, ay), (CANVAS_W - 12, ay + 22), RED if on else (30, 30, 90), -1)

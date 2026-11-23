@@ -76,7 +76,7 @@ _wx = WEATHERS["clear"]   # 지금 그리고 있는 프레임의 날씨 (draw_sc
 HANGUL_KEYS = {0x315C: ord("n"), 0x314D: ord("v"), 0x3131: ord("r"), 0x3142: ord("q"),
                0x3148: ord("w"), 0x314A: ord("c"), 0x3139: ord("f"), 0x314E: ord("g"),
                0x3154: ord("p"), 0x314C: ord("x"), 0x3145: ord("t"), 0x3141: ord("a"), 0x3157: ord("h"),
-               0x3163: ord("l")}
+               0x3163: ord("l"), 0x314B: ord("z")}
 
 
 def normalize_key(key: int) -> int:
@@ -221,7 +221,9 @@ class Camera:
             h = math.radians(ac.heading)
             self.eye = self.target + np.array([math.sin(h) * 16.0, math.cos(h) * 16.0, 1.6])
             a = math.radians(ac.heading + view.look_az)
-            e = math.radians(float(np.clip(pitch_deg + view.look_el, -60.0, 60.0)))
+            # 기수가 들려도 조종사는 계기판 너머로 앞 지면을 내려다본다: 시선은 기수의 절반만 따라간다.
+            # (그대로 따라가면 상승 중에는 하늘만 보여 경로를 놓친다)
+            e = math.radians(float(np.clip(COCKPIT_PITCH * pitch_deg + view.look_el, -60.0, 60.0)))
             f = np.array([math.sin(a) * math.cos(e), math.cos(a) * math.cos(e), math.sin(e)])
         else:
             a = math.radians(ac.heading + view.az)
@@ -299,7 +301,7 @@ GRASS_MPP = 2.0   # 잔디 질감 1픽셀 = 2 m, 500픽셀(1 km)마다 반복
 
 
 AP_PPM = 3.0                                   # 공항 질감 해상도 (픽셀/m)
-AP_X0, AP_X1, AP_Y0, AP_Y1 = -330.0, 60.0, -90.0, 1090.0
+AP_X0, AP_X1, AP_Y0, AP_Y1 = -540.0, 140.0, -140.0, 1140.0
 
 
 def _make_airport():
@@ -309,7 +311,7 @@ def _make_airport():
     img = np.empty((h, w, 3), np.uint8)
     img[:] = key
     to_s = lambda p: (int(round((p[0] - AP_X0) * AP_PPM)), int(round((AP_Y1 - p[1]) * AP_PPM)))
-    ck.draw_airport(img, to_s, AP_PPM)
+    ck.draw_airport(img, to_s, AP_PPM, planes=False)
     alpha = (np.abs(img.astype(np.int16) - key).sum(2) > 0).astype(np.uint8) * 255
     return np.dstack([img, alpha])
 
@@ -318,11 +320,8 @@ _GRASS = scenery.GRASS_TILE   # 도시 그림의 바탕과 같은 무늬라야 �
 _AIRPORT = _make_airport()
 
 # 건물 상자: (x1, y1, x2, y2, 높이, 벽 색, 지붕 색)
-BUILDINGS = [
-    (-292, 440, -252, 560, 14.0, (150, 146, 140), (120, 116, 112)),   # 터미널
-    (-292, 584, -256, 612, 10.0, (132, 128, 124), (100, 98, 96)),     # 격납고
-    (-246, 596, -238, 604, 34.0, (170, 168, 164), (90, 110, 130)),    # 관제탑
-]
+BUILDINGS = ck.AIRPORT_BUILDINGS
+PARKED_MAX_DISTANCE = 2500.0   # 이보다 멀면 주기 중인 여객기를 입체로 그리지 않는다
 
 
 # 도시 그림의 단계별 사용 거리: (축소 단계, 이 거리 안쪽에서만 사용 m). None = 전체
@@ -357,6 +356,63 @@ def _first_ground_row(cam):
     return int(np.clip(math.floor(cam.horizon_y) + 2, 0, H))
 
 
+def _make_ocean(seed=5, size=500):
+    """이어 붙여도 경계가 보이지 않는 바다 질감: 짙은 파랑에 너울과 잔물결."""
+    rng = np.random.default_rng(seed)
+
+    def layer(sx, sy):
+        n = rng.standard_normal((size, size)).astype(np.float32)
+        n = cv2.GaussianBlur(np.tile(n, (3, 3)), (0, 0), sigmaX=sx, sigmaY=sy)[size:2 * size, size:2 * size]
+        return n / (n.std() + 1e-6)
+
+    n = 0.8 * layer(60, 45) + 0.5 * layer(14, 5) + 0.25 * layer(3, 1.2)
+    tile = np.array([112, 70, 28], np.float32) + n[..., None] * np.array([12, 9, 5], np.float32)
+    return np.clip(tile, 0, 255).astype(np.uint8)
+
+
+_OCEAN = _make_ocean()
+_real_ac = None   # 순항 구간에서 계기에 표시할 실제 기체 상태 (화면은 축소한 고도로 그린다)
+_guide = []       # 순항 구간의 길 안내선 (화면 좌표 점들)
+_terrain = None   # 항로 비행의 순항 구간이면 발아래 육지의 비율(0 = 바다 ~ 1 = 육지), 아니면 None (공항 주변)
+
+
+def _draw_enroute_ground(img, cam, y0, shift):
+    """순항 구간의 지면: 높은 고도에서 내려다본 바다 또는 육지 (도시·공항 없음). 해안에서는 둘을 섞는다."""
+    hom = shift @ cam.ground_homography(GRASS_MPP, 0, -GRASS_MPP, 0)
+    warp = lambda tile: cv2.warpPerspective(tile, hom, (W, H - y0), flags=cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_WRAP)
+    if _terrain <= 0.01:
+        img[y0:] = warp(_OCEAN)
+    elif _terrain >= 0.99:
+        img[y0:] = warp(_GRASS)
+    else:
+        img[y0:] = cv2.addWeighted(warp(_GRASS), _terrain, warp(_OCEAN), 1.0 - _terrain, 0)
+
+
+GUIDE_HALF_WIDTH = 45.0   # 길 안내 차선의 반폭 (화면 기준 m)
+
+
+def draw_guide_lane(img, cam):
+    """순항 구간의 길 안내: 앞으로 갈 항로를 따라 두 줄로 뻗은 차선과 일정 간격의 가로줄.
+
+    한 줄로 그리면 조종사 시점에서 가운데 창틀에 가려지므로 양옆으로 벌려 그린다.
+    """
+    if len(_guide) < 2:
+        return
+    pts = np.array(_guide, float)
+    d = np.diff(pts[:, :2], axis=0)
+    d = np.vstack([d, d[-1]])
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    side = np.column_stack([d[:, 1], -d[:, 0], np.zeros(len(d))]) * GUIDE_HALF_WIDTH
+    left, right = pts - side, pts + side
+    for rail in (left, right):
+        for a, b in zip(rail, rail[1:]):
+            line_world(img, cam, a, b, (60, 0, 60), 5)
+            line_world(img, cam, a, b, MAGENTA, 2)
+    for a, b in zip(left[1::2], right[1::2]):   # 1 km마다 가로줄
+        line_world(img, cam, a, b, MAGENTA, 1)
+
+
 def draw_ground(cam, night=False):
     y0 = _first_ground_row(cam)
     img = np.empty((H, W, 3), np.uint8)
@@ -364,6 +420,11 @@ def draw_ground(cam, night=False):
     if y0 >= H:   # 위를 올려다봐서 지면이 화면에 없다
         return img
     shift = np.array([[1, 0, 0], [0, 1, -y0], [0, 0, 1.0]])   # 지평선 아래 행들만 그린다
+    if _terrain is not None:
+        _draw_enroute_ground(img, cam, y0, shift)
+        if _wx["dim"] < 1.0:
+            img = cv2.convertScaleAbs(img, alpha=_wx["dim"])
+        return ck.darken(img) if night else img
     cv2.warpPerspective(_GRASS, shift @ cam.ground_homography(GRASS_MPP, 0, -GRASS_MPP, 0),
                         (W, H - y0), dst=img[y0:], flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
     _warp_city(img, cam, scenery.CITY["day"], True)
@@ -736,6 +797,60 @@ def draw_landing_light(img, cam, ac):
     cv2.addWeighted(layer, alpha, img, 1 - alpha, 0, img)
 
 
+def _make_ridges(seed, octaves, n=2048):
+    """지평선을 한 바퀴 두르는 먼 산등성이의 높이(0~1). 방위 0~360도에 n개, 끝이 이어진다."""
+    rng = np.random.default_rng(seed)
+    a = np.linspace(0, 2 * math.pi, n, endpoint=False)
+    h = np.zeros(n)
+    for k, amp in octaves:
+        h += amp * np.sin(k * a + rng.uniform(0, 2 * math.pi))
+    h = np.abs(h) ** 0.8 * np.sign(h)            # 봉우리는 뾰족하게
+    h = (h - h.min()) / (h.max() - h.min())
+    return h.astype(np.float32)
+
+
+# (높이 배열, 가장 높은 봉우리의 올려본각(도), 가장 낮은 곳의 올려본각, 색이 지평선 색에서 벗어나는 정도)
+_RIDGES = [
+    (_make_ridges(5, [(3, 1.0), (7, 0.6), (13, 0.4), (29, 0.22), (61, 0.12), (127, 0.06)]), 3.4, 0.5, 0.30),
+    (_make_ridges(9, [(5, 1.0), (11, 0.7), (23, 0.4), (47, 0.25), (97, 0.12), (211, 0.06)]), 1.7, 0.15, 0.55),
+]
+MOUNTAIN = np.array([112, 100, 92], np.float32)   # 가까이서 본 산의 색 (푸른 회색, BGR)
+
+
+def draw_mountains(img, cam, haze_color, night):
+    """지평선 위의 먼 산. 아주 멀어서 카메라가 돌 때만 움직이고, 멀수록 지평선 색에 가깝다."""
+    strength = float(np.clip((_wx["fog"] - 1200.0) / 3000.0, 0.0, 1.0))   # 시야가 나쁘면 안 보인다
+    if _terrain is not None:
+        strength *= _terrain   # 순항 구간: 바다 위에서는 산이 없다
+    hy = cam.horizon_y
+    if strength <= 0.02 or hy <= 0 or hy > H + 150:
+        return
+    u = np.arange(-8, W + 9, 4, dtype=np.float64)
+    rays = np.stack([(u - CX) / FOCAL, np.full_like(u, (CY - hy) / FOCAL), np.ones_like(u)], 1) @ cam.rot
+    az = np.arctan2(rays[:, 0], rays[:, 1]) % (2 * math.pi)   # 각 화면 열이 바라보는 방위
+    base = MOUNTAIN * (0.25 if night else 1.0)
+    if _wx["snow"]:
+        base = base * 0.4 + 150.0
+    for heights, top_deg, low_deg, tint in _RIDGES:
+        n = len(heights)
+        elev = np.radians(low_deg + (top_deg - low_deg) * heights[(az / (2 * math.pi) * n).astype(int) % n])
+        pts = np.stack([u, hy - FOCAL * np.tan(elev)], 1)
+        poly = np.vstack([pts, [(W + 8, hy + 1), (-8, hy + 1)]])
+        color = haze_color * (1 - tint * strength) + base * tint * strength
+        cv2.fillPoly(img, [to_px(poly)], tuple(float(c) for c in color), AA)
+
+
+# 색 보정: 사진처럼 중간 밝기의 대비를 조금 높이고(S자 곡선) 화면 가장자리는 조금 어둡게 한다
+_x = np.arange(256, dtype=np.float32) / 255.0
+_GRADE = np.clip((_x + 0.035 * np.sin((_x - 0.5) * 2 * math.pi)) * 255.0, 0, 255).astype(np.uint8)
+_vy, _vx = np.mgrid[0:H, 0:W].astype(np.float32)
+_VIGNETTE = cv2.merge([1.0 - 0.22 * np.clip(((_vx - CX) / CX) ** 2 * 0.5 + ((_vy - CY) / CY) ** 2 * 0.5, 0, 1)] * 3)
+
+
+def grade(img):
+    return cv2.multiply(cv2.LUT(img, _GRADE), _VIGNETTE, dtype=cv2.CV_8U)
+
+
 def draw_fog_and_sky(img, cam, night=False):
     """먼 지면은 지평선 색으로 흐리게, 지평선 위는 하늘."""
     haze_color, zenith = _sky_colors(night)
@@ -751,6 +866,7 @@ def draw_fog_and_sky(img, cam, night=False):
     if top > 0:   # 하늘: 지평선에서 위로 갈수록 짙은 파랑
         k = np.clip((hy - rows[:top]) / (FOCAL * 0.9), 0.0, 1.0)[:, None] ** 0.7
         img[:top] = (haze_color * (1 - k) + zenith * k).astype(np.uint8)[:, None, :]
+        draw_mountains(img, cam, haze_color, night)
         if _wx["sun"]:   # 맑거나 구름이 조금 낀 날에만 해·달·별이 보인다
             if night:
                 draw_sky_objects(img, cam)
@@ -787,6 +903,9 @@ def draw_buildings(img, cam, night=False, clock=0.0):
 # ---------------------------------------------------------------- 목표 경로
 
 PATH_HALF_WIDTH = 2.5   # 지면 위 경로 띠의 반폭 (m)
+GUIDE_REF = (90, 230, 255)   # 조종석 조종 안내의 기준 표시 색 (노랑)
+COCKPIT_PITCH = 0.5   # 조종석 시선이 기수 피치를 따라가는 비율
+AIRPATH = (255, 150, 255)   # 공중 목표 고도 선 (지면 경로보다 밝은 분홍)
 
 
 def draw_targets(img, cam, sc):
@@ -825,14 +944,20 @@ def draw_targets(img, cam, sc):
                 fill_world(img, cam, [(x1 + px, y1 + py, 0), (x2 + px, y2 + py, 0),
                                       (x2 - px, y2 - py, 0), (x1 - px, y1 - py, 0)], MAGENTA, aa=False)
                 line_world(img, cam, (x1, y1, 0), (x2, y2, 0), MAGENTA, 1)
-        elif shape[0] == "point":   # 웨이포인트: 지면 마름모 + 수직 기둥 + 별
+        elif shape[0] == "airpath":   # 목표 고도를 따라 공중에 그은 선 (복잡한 경로 과제)
+            for a, b in zip(shape[1], shape[1][1:]):
+                line_world(img, cam, a, b, AIRPATH, 2)
+        elif shape[0] in ("point", "gate"):   # 웨이포인트: 지면 마름모 + 수직 기둥 + 별
             x, y = shape[1]
+            top = shape[2] if shape[0] == "gate" else 70   # gate는 목표 고도까지 기둥을 세운다
             fill_world(img, cam, [(x, y - 18, 0), (x + 18, y, 0), (x, y + 18, 0), (x - 18, y, 0)],
                        MAGENTA)
-            line_world(img, cam, (x, y, 0), (x, y, 70), MAGENTA, 2)
-            pc = cam.to_cam([(x, y, 70)])
+            line_world(img, cam, (x, y, 0), (x, y, top), MAGENTA, 2)
+            pc = cam.to_cam([(x, y, top)])
             if pc[0, 2] >= NEAR:
                 u, v = (int(k) for k in to_px(cam.project(pc))[0])
+                if shape[0] == "gate" and -100 < u < W + 100 and -100 < v < H + 100:
+                    ck.text(img, f"{top:.0f} m", (u + 16, v + 5), 0.5, WHITE, 2)
                 star = np.array([(u, v - 12), (u + 4, v - 4), (u + 12, v), (u + 4, v + 4),
                                  (u, v + 12), (u - 4, v + 4), (u - 12, v), (u - 4, v - 4)], np.int32)
                 cv2.fillPoly(img, [star], MAGENTA, AA)
@@ -963,9 +1088,25 @@ def draw_aircraft_lights(img, cam, rot, pos, clock):
     draw_point_lights(img, cam, pts, [c for _p, c, _s, _b in on], [s for _p, _c, s, _b in on])
 
 
-def draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night=False, clock=0.0):
+def draw_parked(img, cam, night, clock):
+    """탑승구와 격납고 앞에 서 있는 여객기 (먼 것부터)."""
+    order = sorted(ck.PARKED, key=lambda p: -math.hypot(p[0] - cam.eye[0], p[1] - cam.eye[1]))
+    for x, y, heading in order:
+        if math.hypot(x - cam.eye[0], y - cam.eye[1]) < PARKED_MAX_DISTANCE:
+            draw_aircraft(img, cam, _ParkedAircraft(heading), 0.0, 0.0, night, clock,
+                          pos=np.array([x, y, GEAR_HEIGHT]), lights=False)
+
+
+class _ParkedAircraft:
+    gear_down = True
+
+    def __init__(self, heading):
+        self.heading = heading
+
+
+def draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night=False, clock=0.0, pos=None, lights=True):
     rot = body_rotation(ac.heading, bank_deg, pitch_deg)
-    pos = cam.target
+    pos = cam.target if pos is None else pos
     pc = cam.to_cam(_MODEL["verts"] @ rot.T + pos)
     if (pc[:, 2] < NEAR).any():   # 카메라가 기체 안으로 들어간 경우
         return
@@ -995,7 +1136,7 @@ def draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night=False, clock=0.0):
             n = -n         # 날개 같은 얇은 판은 양면
         a, b = _MODEL["spans"][i]
         cv2.fillPoly(img, [uv[a:b]], _shaded(_MODEL["colors"][i], n, ambient), AA)
-    if night:
+    if night and lights:
         draw_aircraft_lights(img, cam, rot, pos, clock)
 
 
@@ -1071,6 +1212,14 @@ def draw_scene(view, sc, ac, trail, fx):
     cam = Camera(view, ac, pitch_deg)
     cockpit = cam.cockpit
     img = draw_ground(cam, night)
+    if _terrain is not None:   # 순항 구간: 공항·도시·경로 표시 없이 하늘과 구름, 기체만
+        draw_fog_and_sky(img, cam, night)
+        draw_clouds(img, cam, night, fx.clock)
+        draw_guide_lane(img, cam)
+        if not cockpit:
+            draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night, fx.clock)
+        draw_lightning(img, fx.clock, cam.horizon_y)
+        return apply_motion(grade(img), fx, bank_deg if cockpit else None, _real_ac, night)
     draw_targets(img, cam, sc)
     draw_marks(img, cam, fx)
     if night:
@@ -1086,7 +1235,13 @@ def draw_scene(view, sc, ac, trail, fx):
     draw_city(img, faces, farther_than=plane_depth)   # 기체보다 먼 건물
     if night:
         draw_night_lights(img, cam, fx.clock)
-    draw_buildings(img, cam, night, fx.clock)
+    # 주기 중인 여객기는 터미널의 동쪽에 있다: 카메라가 그보다 서쪽이면 여객기를 먼저 그린다
+    if cam.eye[0] < -340.0:
+        draw_parked(img, cam, night, fx.clock)
+        draw_buildings(img, cam, night, fx.clock)
+    else:
+        draw_buildings(img, cam, night, fx.clock)
+        draw_parked(img, cam, night, fx.clock)
     if fx.env is not None:
         draw_windsocks(img, cam, fx.env)
     draw_trail(img, cam, trail)
@@ -1098,6 +1253,7 @@ def draw_scene(view, sc, ac, trail, fx):
         draw_city(img, faces, nearer_than=plane_depth)    # 기체보다 가까운 건물은 기체를 가린다
         draw_smoke(img, cam, fx)
     draw_lightning(img, fx.clock, cam.horizon_y)
+    img = grade(img)
     return apply_motion(img, fx, bank_deg if cockpit else None, ac, night)
 
 
@@ -1181,13 +1337,22 @@ def draw_cockpit_frame(img, ac, night=False):
 
 def render(view, sc, ac, trail, ctrl, cam_frame, hand, phase, t, info, fx):
     """한 프레임 전체(왼쪽 화면 + 계기판)를 그린다."""
-    global _wx
+    global _wx, _terrain, _real_ac, _guide
     _wx = WEATHERS[view.weather]
-    if view.mode == "3d":
-        scene = draw_scene(view, sc, ac, trail, fx)
+    _real_ac = ac
+    airway = info.get("airway")   # 항로 비행의 순항 구간: 지도는 세계 지도, 지면은 바다·육지
+    _terrain = airway["land"] if airway else None
+    _guide = airway["guide"] if airway else []
+    if airway and view.mode != "3d":
+        scene = airway["map"].draw(airway["frac"])
+        help_text = HELP_2D
+    elif view.mode == "3d":
+        scene = draw_scene(view, sc, airway["visual"] if airway else ac, trail, fx)
         # 미니맵 (오른쪽 아래): 경로에서 벗어난 정도를 위에서 확인
         _mini["n"] += 1
-        if _mini["img"] is None or _mini["n"] % 3 == 0:   # 미니맵은 3프레임에 한 번만 다시 그린다
+        if airway:
+            _mini["img"] = airway["minimap"].draw(airway["frac"])
+        elif _mini["img"] is None or _mini["n"] % 3 == 0:   # 미니맵은 3프레임에 한 번만 다시 그린다
             _mini["img"] = cv2.resize(ck.draw_map(sc, ac, trail, decorations=False, fx=fx, night=view.night),
                                       (MINIMAP, MINIMAP), interpolation=cv2.INTER_AREA)
         mini = _mini["img"]
@@ -1199,8 +1364,21 @@ def render(view, sc, ac, trail, ctrl, cam_frame, hand, phase, t, info, fx):
         scene = ck.draw_map(sc, ac, trail, fx=fx, night=view.night)
         draw_lightning(scene, fx.clock)
         help_text = HELP_2D
+    if view.mode == "3d" and view.cam == "cockpit" and info.get("fd") is not None:
+        # 앞 유리창의 조종 안내: 가운데 기준 표시에 마젠타 십자선을 맞추면 된다
+        cx, cy = COCKPIT_CENTER
+        ck.draw_fd(scene, cx, cy, info["fd"], reach=90, size=60)
+        for sign in (-1, 1):
+            cv2.line(scene, (cx + sign * 14, cy), (cx + sign * 40, cy), (0, 0, 0), 4, AA)
+            cv2.line(scene, (cx + sign * 14, cy), (cx + sign * 40, cy), GUIDE_REF, 2, AA)
+        cv2.circle(scene, (cx, cy), 5, (0, 0, 0), 3, AA)
+        cv2.circle(scene, (cx, cy), 5, GUIDE_REF, 2, AA)
     draw_precipitation(scene, fx.clock)
     ck.draw_overlays(scene, sc, ac, phase, t, info, fx)
+    if airway:   # 길 안내: 목적지, 남은 거리, 남은 시간
+        ck.shade(scene, 296, 48, 692, 76, (60, 20, 60), 0.75)
+        cv2.rectangle(scene, (296, 48), (692, 76), MAGENTA, 1)
+        ck.text(scene, airway["banner"], (494, 68), 0.5, WHITE, 1, "c")
     draw_time_button(scene, view.night)
     draw_cam_button(scene, view.cam)
     draw_weather_button(scene, view.weather)

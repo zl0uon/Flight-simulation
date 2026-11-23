@@ -48,8 +48,14 @@ class FlightController:
     스로틀(0~100%)   펼친 손가락 개수
     """
 
+    HOLD_FRAMES = 12   # 손을 잠깐 놓쳐도 이만큼(약 0.4초)은 직전 조종 입력을 유지한다
+    KNUCKLES = (5, 9, 13, 17)   # 검지~새끼 손가락 뿌리
+    CALIB_FRAMES = 20        # 중립 자세를 재는 프레임 수 (약 0.7초)
+    MAX_NEUTRAL = 25.0       # 중립으로 인정하는 좌우 기울기의 한계 (도)
+    MAX_PITCH_NEUTRAL = 20.0
+
     def __init__(self, window: int = 5, deadzone_deg: float = 5.0,
-                 max_roll_deg: float = 45.0, pitch_deadzone_deg: float = 10.0,
+                 max_roll_deg: float = 30.0, pitch_deadzone_deg: float = 10.0,
                  max_pitch_deg: float = 40.0, invert_pitch: bool = False):
         self.angles = deque(maxlen=window)   # 최근 N프레임 손목 기울기(도)
         self.pitch_angles = deque(maxlen=window)   # 최근 N프레임 손바닥 앞뒤 기울기(도)
@@ -64,6 +70,12 @@ class FlightController:
         self.roll = 0.0      # -1.0(좌) ~ 1.0(우)
         self.pitch = 0.0     # -1.0(하강) ~ 1.0(상승)
         self.throttle = 0    # 0, 25, 50, 75, 100
+        self.missed = 0      # 손을 연속으로 놓친 프레임 수
+        # 중립 자세: 편하게 든 손은 똑바로 서지 않고 한쪽으로 기울어 있다(팔이 옆에서 올라오므로).
+        # 그 각도를 0으로 삼지 않으면 한쪽은 조금만 기울여도 돌고 반대쪽은 한참 꺾어야 돈다.
+        self.neutral = 0.0
+        self.pitch_neutral = 0.0
+        self._calib = []     # 중립을 재는 중이면 [(좌우 각, 앞뒤 각), ...], 끝났으면 None
 
     @staticmethod
     def palm_pitch(world) -> float:
@@ -86,21 +98,34 @@ class FlightController:
             return 0.0
         return math.copysign(min((a - deadzone) / (full - deadzone), 1.0), angle)
 
-    @staticmethod
-    def wrist_angle(landmarks, w: int, h: int) -> float:
-        """손목(0) -> 중지 뿌리(9) 벡터의 수직 대비 기울기(도). 오른쪽으로 기울면 +."""
+    @classmethod
+    def wrist_angle(cls, landmarks, w: int, h: int) -> float:
+        """손목(0) -> 손가락 뿌리 네 점의 중심 벡터의 수직 대비 기울기(도). 오른쪽으로 기울면 +.
+
+        한 점(중지 뿌리)만 쓰면 그 점이 떨릴 때 각도가 같이 떨려서, 네 점의 평균을 쓴다.
+        """
         # 정규화 좌표는 가로세로 비율이 달라 픽셀 단위로 바꿔서 계산
-        dx = (landmarks[9].x - landmarks[0].x) * w
-        dy = (landmarks[9].y - landmarks[0].y) * h
+        n = len(cls.KNUCKLES)
+        dx = (sum(landmarks[i].x for i in cls.KNUCKLES) / n - landmarks[0].x) * w
+        dy = (sum(landmarks[i].y for i in cls.KNUCKLES) / n - landmarks[0].y) * h
         return math.degrees(math.atan2(dx, -dy))  # 손이 똑바로 서 있으면 0도
 
     def update(self, landmarks, handedness: str, w: int, h: int, world=None):
         """world(월드 랜드마크)를 주면 손바닥 앞뒤 기울기로 pitch도 정한다."""
-        self.angles.append(self.wrist_angle(landmarks, w, h))
-        self.fingers.append(count_fingers(landmarks, handedness))
+        self.missed = 0
+        angle = self.wrist_angle(landmarks, w, h)
+        tilt = None
         if world is not None:
             tilt = self.palm_pitch(world)
-            self.pitch_angles.append(-tilt if self.invert_pitch else tilt)
+            tilt = -tilt if self.invert_pitch else tilt
+        if self._calib is not None:   # 처음 손이 보인 동안의 자세를 중립으로 삼는다
+            self._calib.append((angle, tilt))
+            if len(self._calib) >= self.CALIB_FRAMES:
+                self._finish_calibration()
+        self.angles.append(angle - self.neutral)
+        self.fingers.append(count_fingers(landmarks, handedness))
+        if tilt is not None:
+            self.pitch_angles.append(tilt - self.pitch_neutral)
 
         # 이동 평균
         self.angle = sum(self.angles) / len(self.angles)
@@ -113,6 +138,34 @@ class FlightController:
         self.pitch = self._scaled(self.pitch_angle, self.pitch_deadzone, self.max_pitch)
 
         self.throttle = THROTTLE_MAP[int(round(avg_fingers))]
+
+    @property
+    def calibrating(self) -> bool:
+        return self._calib is not None
+
+    def recalibrate(self):
+        """지금부터 보이는 손 자세를 새 중립으로 삼는다."""
+        self._calib = []
+
+    def _finish_calibration(self):
+        median = lambda v: sorted(v)[len(v) // 2]
+        clamp = lambda v, lim: max(-lim, min(lim, v))
+        self.neutral = clamp(median([a for a, _ in self._calib]), self.MAX_NEUTRAL)
+        tilts = [t for _, t in self._calib if t is not None]
+        self.pitch_neutral = clamp(median(tilts), self.MAX_PITCH_NEUTRAL) if tilts else 0.0
+        self._calib = None
+        self.angles.clear()
+        self.pitch_angles.clear()
+
+    def lost(self):
+        """이번 프레임에 손을 못 찾았다. 잠깐 놓친 것이면 직전 입력을 유지하고, 길어지면 중립으로.
+
+        손을 크게 기울이면 인식이 한두 프레임씩 끊기는데, 그때마다 중립으로 돌아가면
+        선회가 계속 풀려 버린다.
+        """
+        self.missed += 1
+        if self.missed > self.HOLD_FRAMES:
+            self.reset()
 
     def reset(self):
         """손을 놓치면 조종간(roll, pitch)은 중립으로 복귀, 스로틀은 마지막 값 유지."""
@@ -233,14 +286,14 @@ def main():
     parser = argparse.ArgumentParser(description="MediaPipe 손 인식")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--max-hands", type=int, default=2)
-    parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--min-confidence", type=float, default=0.3)
     parser.add_argument("--smooth", type=int, default=5, help="이동 평균 프레임 수")
     parser.add_argument("--deadzone", type=float, default=5.0, help="roll 데드존(도)")
     parser.add_argument("--pitch-deadzone", type=float, default=10.0, help="pitch 데드존(도)")
     parser.add_argument("--max-pitch", type=float, default=40.0,
                         help="pitch가 최대(±1.0)가 되는 손바닥 앞뒤 기울기(도)")
     parser.add_argument("--invert-pitch", action="store_true", help="pitch 방향을 반대로")
-    parser.add_argument("--max-roll", type=float, default=45.0,
+    parser.add_argument("--max-roll", type=float, default=30.0,
                         help="roll이 최대(±1.0)가 되는 기울기(도)")
     args = parser.parse_args()
 
@@ -294,7 +347,7 @@ def main():
                     ctrl.update(result.hand_landmarks[0],
                                 result.handedness[0][0].category_name, w, h, world)
                 else:
-                    ctrl.reset()
+                    ctrl.lost()
                 draw_hud(frame, ctrl, bool(result.hand_landmarks))
 
                 now = time.time()
