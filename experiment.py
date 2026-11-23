@@ -33,12 +33,19 @@
     손바닥 앞뒤 기울임 = 상승·하강: 손끝을 내 쪽으로 젖히면 상승, 카메라 쪽으로 숙이면 하강
     (방향이 반대로 느껴지면 --invert-pitch)
 
+기체 계통 (키보드): F = 플랩 다음 단계(UP -> 1 -> 2 -> FULL), G = 착륙 장치 올림/내림.
+    건드리지 않으면 플랩 UP·착륙 장치 자동으로, 계통이 없던 때와 똑같이 비행한다.
+
+교관석 기능 (자유 비행 모드에서만): P 일시 정지, X 엔진 고장, T 돌풍 주입,
+    R 활주로에서 다시 시작, L 최종 접근 3 km 지점, H 공항 상공 300 m.
+
 화면 안내 문구는 영어다 (OpenCV 기본 글꼴은 한글을 그리지 못함).
 화면 시점 (기본은 3D 추적 화면)
     마우스 왼쪽 드래그 / 트랙패드 두 손가락 스크롤 / 방향키 / 4 6 8 2   카메라 회전
     + - / Ctrl(또는 Option) + 스크롤                                   확대 / 축소
     1 뒤 / 3 옆 / 7 위 / 9 앞             미리 정한 시점,  5 또는 0 = 기본 시점
     V                                     3D <-> 2D 지도 전환
+    A 또는 C, 화면 위 시점 버튼 클릭       조종사 시점 <-> 외부 시점 (--cam pilot 으로 조종사 시점에서 시작)
     N 또는 화면 위 DAY/NIGHT 버튼 클릭     낮 <-> 밤 전환 (--time night 으로 밤에서 시작)
     W 또는 그 옆 날씨 버튼 클릭           날씨 전환 (--weather rain 처럼 시작 날씨 지정)
 
@@ -262,7 +269,7 @@ def run_trial(inp, name, info, rng):
     env = None
     if ENVIRONMENTS[info["env"]] is not None:
         env = Environment(info["env"], info["wind_from"], seed=rng.random())
-    fx = FlightEffects(ac, ctrl, env)   # 이륙·착륙 연출 (표시 전용)
+    fx = FlightEffects(ac, ctrl, env, info.get("motion", True))   # 이륙·착륙 연출, 움직임 효과 (표시 전용)
 
     phase = "ready"
     ready_until = time.monotonic() + rng.uniform(*READY_DELAY)
@@ -324,6 +331,8 @@ def run_trial(inp, name, info, rng):
             if user_wants_quit():
                 quit_requested = True
                 break
+            while _keys:
+                system_key(_keys.pop(), ac)
     except KeyboardInterrupt:   # 터미널에서 Ctrl+C
         quit_requested = True
 
@@ -365,21 +374,57 @@ FREE_NOTICE_SECONDS = 5.0   # 접지 결과를 보여주는 시간
 FREE_TRAIL_POINTS = 2000    # 궤적은 최근 것만 남긴다 (약 10 km)
 
 
+def system_key(key, ac) -> bool:
+    """기체 계통 조작 키 (모든 비행 모드): F = 플랩 다음 단계, G = 착륙 장치 올림/내림."""
+    if key in (ord("f"), ord("F")):
+        ac.next_flaps()
+    elif key in (ord("g"), ord("G")):
+        ac.toggle_gear()
+    else:
+        return False
+    return True
+
+
+# 교관석에서 기체를 옮겨 놓을 수 있는 위치: 키 -> (설명, x, y, 방위, 속도, 고도)
+REPOSITIONS = {
+    ord("l"): ("최종 접근 3 km", 0.0, -3000.0, 0.0, 36.0, 160.0),
+    ord("h"): ("공항 상공 300 m", 0.0, -800.0, 0.0, 36.0, 300.0),
+}
+GUST_KICK = (7.0, 0.0, -8.0)   # 교관석의 돌풍 주입: 돌풍 성분(동, 북, 위)에 더하는 양 (m/s)
+
+
 def run_free(inp, info, rng):
-    """자유 비행: 과제 없이 창을 닫을 때까지 난다. 아무것도 기록하지 않는다."""
+    """자유 비행: 과제 없이 창을 닫을 때까지 난다. 아무것도 기록하지 않는다.
+
+    훈련 시뮬레이터의 교관석(IOS)처럼 일시 정지, 위치 재배치, 비상 상황 주입을 키로 할 수 있다.
+        P 일시 정지(프리즈)   X 엔진 고장 걸기/풀기   T 강한 돌풍 주입
+        R 활주로에서 다시 시작   L 최종 접근 3 km 지점으로   H 공항 상공 300 m로
+    """
     def start():
         sc = FreeFlight()
         ac = sc.initial_aircraft()
         env = None
         if ENVIRONMENTS[info["env"]] is not None:
             env = Environment(info["env"], info["wind_from"], seed=rng.random())
-        return sc, ac, env, FlightEffects(ac, inp.ctrl, env), [(ac.x, ac.y, ac.alt)]
+        return (sc, ac, env, FlightEffects(ac, inp.ctrl, env, info.get("motion", True)),
+                [(ac.x, ac.y, ac.alt)])
+
+    def reposition(key):
+        """기체를 공중의 정해진 위치로 옮긴다 (계통 상태와 날씨는 그대로)."""
+        _name, x, y, heading, speed, alt = REPOSITIONS[key]
+        ac.x, ac.y, ac.heading, ac.speed, ac.alt = x, y, heading, speed, alt
+        ac.airborne, ac.vs, ac.bank, ac.ground_speed, ac.stalled = True, 0.0, 0.0, speed, False
+        trail[:] = [(ac.x, ac.y, ac.alt)]
+        fx.touchdown = fx.liftoff = None
+        fx._prev_alt, fx._prev_speed = ac.alt, ac.speed
 
     ctrl = inp.ctrl
     sc, ac, env, fx, trail = start()
     t = 0.0
     notice_until = 0.0
     landings = 0   # 다시 시작(R)해도 이어서 센다
+    frozen = False
+    gust_until = 0.0
     last = time.monotonic()
     try:
         while True:
@@ -392,26 +437,46 @@ def run_free(inp, info, rng):
             dt = min(now - last, 0.1)
             last = now
 
-            event = ac.step(ctrl.roll, ctrl.throttle, dt, env, ctrl.pitch)
-            t += dt
-            sc.update(ac, event, t)
-            if event == "touchdown":
-                landings += 1
-                notice_until = now + FREE_NOTICE_SECONDS
-            if np.hypot(ac.x - trail[-1][0], ac.y - trail[-1][1]) > 5:
-                trail.append((ac.x, ac.y, ac.alt))
-                del trail[:-FREE_TRAIL_POINTS]
-            fx.update(ac, ctrl, event, dt)
+            if not frozen:   # 프리즈 중에는 시간이 멈춘다 (화면과 시점 조작은 계속된다)
+                event = ac.step(ctrl.roll, ctrl.throttle, dt, env, ctrl.pitch)
+                t += dt
+                sc.update(ac, event, t)
+                if event == "touchdown":
+                    landings += 1
+                    notice_until = now + FREE_NOTICE_SECONDS
+                if np.hypot(ac.x - trail[-1][0], ac.y - trail[-1][1]) > 5:
+                    trail.append((ac.x, ac.y, ac.alt))
+                    del trail[:-FREE_TRAIL_POINTS]
+                fx.update(ac, ctrl, event, dt)
 
+            # 교관석 상태 표시: 지금 걸려 있는 상황들
+            info["ios"] = [word for word, on in (("FREEZE", frozen), ("ENG FAIL", ac.engine_failed),
+                                                 ("GUST", now < gust_until)) if on]
             phase = "result" if now < notice_until else "run"   # 접지 직후에만 결과를 띄운다
             cv2.imshow(WINDOW_NAME,
                        render(_view, sc, ac, trail, ctrl, cam, hand, phase, t, info, fx))
             if user_wants_quit():
                 break
             while _keys:
-                if _keys.pop() in (ord("r"), ord("R")):   # 활주로 출발 위치에서 다시 시작
+                key = _keys.pop()
+                lower = key | 0x20 if 0 < key < 128 else key   # 대문자도 같은 키로
+                if system_key(key, ac):
+                    pass
+                elif lower == ord("r"):   # 활주로 출발 위치에서 다시 시작 (고장도 풀린다)
                     sc, ac, env, fx, trail = start()
-                    t, notice_until = 0.0, 0.0
+                    t, notice_until, frozen = 0.0, 0.0, False
+                elif lower == ord("p"):   # 프리즈
+                    frozen = not frozen
+                elif lower == ord("x"):   # 엔진 고장 걸기 / 풀기
+                    ac.engine_failed = not ac.engine_failed
+                elif lower == ord("t"):   # 강한 돌풍 (옆바람 + 하강 기류). 몇 초에 걸쳐 잦아든다
+                    if env is not None:
+                        for i, kick in enumerate(GUST_KICK):
+                            env.gust[i] += kick
+                        gust_until = now + 4.0
+                elif lower in REPOSITIONS:
+                    reposition(lower)
+                    notice_until = 0.0
     except KeyboardInterrupt:   # 터미널에서 Ctrl+C
         pass
     return landings
@@ -503,6 +568,8 @@ VIEW_HELP = ("화면 시점: 마우스 드래그·트랙패드 두 손가락 스
              "           1 3 7 9 = 미리 정한 시점, 5 = 기본 시점, V = 3D/2D 전환,\n"
              "낮/밤 전환: N 키 또는 화면 위 가운데의 DAY/NIGHT 버튼 클릭\n"
              "날씨 전환: W 키 또는 그 옆의 날씨 버튼 클릭\n"
+             "조종석 시점: C 키 (뒤에서 따라가는 시점과 전환, 조종석에서는 드래그로 고개 돌리기)\n"
+             "기체 계통: F = 플랩 다음 단계, G = 착륙 장치 올림/내림\n"
              "종료: 창의 닫기 버튼, q 또는 ESC\n")
 
 
@@ -542,6 +609,29 @@ def ask_weather() -> str:
             raise SystemExit("\n날씨를 고르지 않아 시작하지 않습니다.")
         if answer == "":
             return "clear"
+        if answer in names:
+            return answer
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        print(f"1~{len(names)} 중에서 골라 주세요.")
+
+
+CAMS = {"pilot": "조종사 시점 (조종석에서 앞을 봄)", "outside": "외부 시점 (기체 뒤에서 따라가며 봄)"}
+
+
+def ask_cam() -> str:
+    """--cam 없이 실행하면 터미널에서 시점을 고르게 한다."""
+    names = list(CAMS)
+    print("시점을 고르세요 (실행 중에도 A 키나 화면 위 버튼으로 바꿀 수 있습니다)")
+    for i, name in enumerate(names, 1):
+        print(f"  {i}) {CAMS[name]}")
+    while True:
+        try:
+            answer = input(f"번호 입력 (1~{len(names)}, 그냥 Enter = 외부 시점): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\n시점을 고르지 않아 시작하지 않습니다.")
+        if answer == "":
+            return "outside"
         if answer in names:
             return answer
         if answer.isdigit() and 1 <= int(answer) <= len(names):
@@ -598,6 +688,7 @@ def main_staged(args, parser):
         "session_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
         "env": args.env,
         "wind_from": args.wind_from,
+        "motion": not args.no_motion,
     }
     if not ask_consent(info["participant"], args.output):
         print("동의하지 않아 실험을 시작하지 않습니다. 카메라는 켜지지 않았고 기록도 남지 않았습니다.")
@@ -633,11 +724,13 @@ def main_free(args):
     """자유 비행: 손으로 조종하지만 과제도 기록도 없다."""
     print("자유 비행 모드입니다. 과제나 판정 없이 자유롭게 비행합니다.")
     print("웹캠 영상은 손 인식을 위해 메모리에서만 처리되며 저장되지 않습니다. 비행 기록도 남기지 않습니다.")
-    print("R 키 = 활주로 출발 위치에서 다시 시작\n")
+    print("교관석 기능 (키): P = 일시 정지,  X = 엔진 고장 걸기/풀기,  T = 강한 돌풍 주입\n"
+          "                  R = 활주로에서 다시 시작,  A = 최종 접근 3 km 지점,  H = 공항 상공 300 m\n")
     print(VIEW_HELP)
     print_environment(args)
     info = {"participant": "FREE FLIGHT", "mode": args.mode, "subtitle": "NOT RECORDED",
-            "trial_no": None, "env": args.env, "wind_from": args.wind_from, "hint": "R: RESTART"}
+            "trial_no": None, "env": args.env, "wind_from": args.wind_from, "hint": "R: RESTART",
+            "ios": [], "motion": not args.no_motion}
     forbid_frame_saving()
     inp = MODES[args.mode](args)
     try:
@@ -659,7 +752,7 @@ def main_auto(args):
     print_environment(args)
     info = {"participant": "AUTOPILOT", "mode": "auto", "subtitle": "NOT RECORDED",
             "session_id": "", "trial_label": "RUN", "autopilot": True,
-            "env": args.env, "wind_from": args.wind_from}
+            "env": args.env, "wind_from": args.wind_from, "motion": not args.no_motion}
     rng = random.Random(args.seed)
     inp = AutoInput(args)
     runs = 0
@@ -712,6 +805,12 @@ def main():
                         help="날씨(화면 효과와 시야): clear 맑음, cloudy 흐림, rain 비, storm 뇌우, "
                              "fog 안개, snow 눈. 생략하면 실행 후 고릅니다 (실행 중 W 키로도 전환). "
                              "바람·난기류는 --env 로 따로 정합니다")
+    parser.add_argument("--cam", choices=list(CAMS), default=None,
+                        help="시점: pilot = 조종사 시점, outside = 외부 시점. 생략하면 실행 후 고릅니다 "
+                             "(실행 중 A 키나 화면 위 버튼으로도 전환)")
+    parser.add_argument("--cockpit", action="store_true", help="--cam pilot 과 같다")
+    parser.add_argument("--no-motion", action="store_true",
+                        help="움직임 효과(가속·난기류·접지 때의 화면 흔들림)를 끈다")
     parser.add_argument("--view", choices=["3d", "2d"], default="3d",
                         help="시작 화면: 3d = 3D 추적 화면, 2d = 위에서 본 지도 (실행 중 V 키로 전환)")
     parser.add_argument("--camera", type=int, default=0)
@@ -734,6 +833,9 @@ def main():
     print(f"시간대: {'밤' if _view.night else '낮'}\n")
     _view.weather = args.weather or ask_weather()
     print(f"날씨: {WEATHER_NAMES[_view.weather]}\n")
+    cam = "pilot" if args.cockpit else (args.cam or ("outside" if args.view == "2d" else ask_cam()))
+    _view.cam = "cockpit" if cam == "pilot" else "chase"
+    print(f"시점: {CAMS[cam]}\n")
     if flight == "staged":
         main_staged(args, parser)
     elif flight == "free":

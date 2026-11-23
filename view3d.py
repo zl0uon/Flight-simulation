@@ -9,6 +9,8 @@
 시점 조작 (View)
     N 또는 화면 위 DAY/NIGHT 버튼 클릭   낮 <-> 밤 전환
     W 또는 그 옆 날씨 버튼 클릭         날씨 전환 (맑음 -> 흐림 -> 비 -> 뇌우 -> 안개 -> 눈)
+    C                       조종석 1인칭 시점 <-> 뒤에서 따라가는 시점
+                            (조종석에서는 드래그·방향키로 고개를 돌린다)
     마우스 왼쪽 드래그      카메라 회전 (좌우 = 둘레, 상하 = 높이)
     트랙패드 두 손가락 스크롤 (또는 마우스 휠)   카메라 회전
     Ctrl 또는 Option + 스크롤, + / -            확대 / 축소
@@ -45,6 +47,7 @@ SUN = np.array([0.35, 0.25, 0.9]) / np.linalg.norm([0.35, 0.25, 0.9])   # 빛이
 
 TIME_BUTTON = (296, 10, 420, 42)   # 화면 위 가운데의 낮/밤 전환 버튼 (x1, y1, x2, y2)
 WEATHER_BUTTON = (428, 10, 566, 42)   # 그 옆의 날씨 전환 버튼
+CAM_BUTTON = (574, 10, 692, 42)   # 그 옆의 시점 전환 버튼 (조종사 시점 <-> 외부 시점)
 
 # 날씨별 화면 설정 (표시 전용. 바람·난기류는 --env 로 따로 정한다)
 #   fog    멀리 흐려지는 거리 척도 (m): 작을수록 시야가 나쁘다
@@ -69,9 +72,11 @@ WEATHERS = {
 }
 _wx = WEATHERS["clear"]   # 지금 그리고 있는 프레임의 날씨 (draw_scene이 정한다)
 
-# 한글 입력 상태에서 누른 키: 같은 자리의 영문 키로 바꿔 준다 (n = ㅜ, v = ㅍ, r = ㄱ, q = ㅂ, w = ㅈ)
+# 한글 입력 상태에서 누른 키: 같은 자리의 영문 키로 바꿔 준다 (n = ㅜ, v = ㅍ, r = ㄱ, q = ㅂ, w = ㅈ ...)
 HANGUL_KEYS = {0x315C: ord("n"), 0x314D: ord("v"), 0x3131: ord("r"), 0x3142: ord("q"),
-               0x3148: ord("w")}
+               0x3148: ord("w"), 0x314A: ord("c"), 0x3139: ord("f"), 0x314E: ord("g"),
+               0x3154: ord("p"), 0x314C: ord("x"), 0x3145: ord("t"), 0x3141: ord("a"), 0x3157: ord("h"),
+               0x3163: ord("l")}
 
 
 def normalize_key(key: int) -> int:
@@ -95,13 +100,20 @@ class View:
         self.mode = mode
         self.night = False   # 밤 화면 여부 (N 키로 전환)
         self.weather = "clear"   # 날씨 (W 키로 다음 날씨)
+        self.cam = "chase"       # chase = 뒤에서 따라가는 시점, cockpit = 조종석 1인칭 (C 키로 전환)
+        self.look_az = self.look_el = 0.0   # 조종석에서 고개를 돌린 각도 (도)
         self.az, self.el, self.dist = self.DEFAULT
         self._drag = None
 
     def reset(self):
         self.az, self.el, self.dist = self.DEFAULT
+        self.look_az = self.look_el = 0.0
 
     def orbit(self, d_az, d_el):
+        if self.cam == "cockpit":   # 조종석에서는 고개를 돌린다 (좌우 ±110도, 상하 ±35도)
+            self.look_az = float(np.clip(self.look_az - d_az * 0.6, -110.0, 110.0))
+            self.look_el = float(np.clip(self.look_el + d_el * 0.6, -35.0, 35.0))
+            return
         self.az = (self.az + d_az + 180.0) % 360.0 - 180.0
         self.el = float(np.clip(self.el + d_el, 3.0, 88.0))
 
@@ -116,6 +128,8 @@ class View:
             self.night = not self.night
         elif key in (ord("w"), ord("W")):
             self.next_weather()
+        elif key in (ord("a"), ord("A"), ord("c"), ord("C")):   # 조종사 시점 <-> 외부 시점
+            self.toggle_cam()
         elif self.mode != "3d":
             return False
         elif key in self.LEFT:
@@ -142,6 +156,13 @@ class View:
         names = list(WEATHERS)
         self.weather = names[(names.index(self.weather) + 1) % len(names)]
 
+    def toggle_cam(self):
+        """조종사 시점 <-> 외부 시점. 2D 지도를 보고 있었다면 3D 화면으로 돌아온다."""
+        if self.mode != "3d":
+            self.mode = "3d"
+        else:
+            self.cam = "cockpit" if self.cam == "chase" else "chase"
+
     def on_mouse(self, event, x, y, flags):
         if event == cv2.EVENT_LBUTTONDOWN:   # 낮/밤 버튼과 날씨 버튼 (2D·3D 공통)
             x1, y1, x2, y2 = TIME_BUTTON
@@ -151,6 +172,10 @@ class View:
             x1, y1, x2, y2 = WEATHER_BUTTON
             if x1 <= x <= x2 and y1 <= y <= y2:
                 self.next_weather()
+                return
+            x1, y1, x2, y2 = CAM_BUTTON
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                self.toggle_cam()
                 return
         if self.mode != "3d":
             return
@@ -187,15 +212,25 @@ class View:
 class Camera:
     """한 프레임의 카메라: 월드 좌표(x 동, y 북, z 위) -> 카메라 좌표 -> 화면."""
 
-    def __init__(self, view, ac):
+    def __init__(self, view, ac, pitch_deg=0.0):
         self.target = np.array([ac.x, ac.y, ac.alt + GEAR_HEIGHT])
-        a = math.radians(ac.heading + view.az)
-        e = math.radians(view.el)
-        back = np.array([-math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)])
-        self.eye = self.target + back * view.dist
-        self.eye[2] = max(self.eye[2], 1.5)
-        f = self.target - self.eye
-        f /= np.linalg.norm(f)
+        self.cockpit = view.cam == "cockpit"
+        if self.cockpit:
+            # 조종석: 기수 쪽 조종사 눈높이에서 기수 방향(+ 고개 돌린 각)을 본다.
+            # 좌우 기울기(뱅크)는 여기서 넣지 않고, 다 그린 그림을 돌려서 표현한다.
+            h = math.radians(ac.heading)
+            self.eye = self.target + np.array([math.sin(h) * 16.0, math.cos(h) * 16.0, 1.6])
+            a = math.radians(ac.heading + view.look_az)
+            e = math.radians(float(np.clip(pitch_deg + view.look_el, -60.0, 60.0)))
+            f = np.array([math.sin(a) * math.cos(e), math.cos(a) * math.cos(e), math.sin(e)])
+        else:
+            a = math.radians(ac.heading + view.az)
+            e = math.radians(view.el)
+            back = np.array([-math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)])
+            self.eye = self.target + back * view.dist
+            self.eye[2] = max(self.eye[2], 1.5)
+            f = self.target - self.eye
+            f /= np.linalg.norm(f)
         r = np.cross(f, [0.0, 0.0, 1.0])
         r /= np.linalg.norm(r)
         self.rot = np.array([r, np.cross(r, f), f])   # 행: 오른쪽, 위, 앞
@@ -301,8 +336,9 @@ def _warp_city(img, cam, levels, transparent):
     transparent=True면 그림 바깥은 img를 그대로 두고, False면 검정(불빛 그림용).
     """
     hy = cam.horizon_y
+    first = _first_ground_row(cam)
     for level, max_dist in CITY_LEVELS:
-        y0 = 0 if max_dist is None else int(np.clip(math.ceil(hy + cam.eye[2] * FOCAL / max_dist), 0, H))
+        y0 = first if max_dist is None else max(first, int(np.clip(math.ceil(hy + cam.eye[2] * FOCAL / max_dist), 0, H)))
         if y0 >= H:
             continue
         mpp = scenery.MPP * (1 << level)
@@ -312,13 +348,29 @@ def _warp_city(img, cam, levels, transparent):
                             borderMode=cv2.BORDER_TRANSPARENT if transparent else cv2.BORDER_CONSTANT)
 
 
+def _first_ground_row(cam):
+    """지면이 보이기 시작하는 화면 행 (지평선 바로 아래).
+
+    지평선과 그 위의 화면 점은 지면의 무한히 먼 곳(또는 카메라 뒤)에 대응한다. 그런 점까지 지면
+    그림을 깔려고 하면 좌표가 무한대가 되어 OpenCV가 비정상 종료하므로, 지평선 아래 행만 그린다.
+    """
+    return int(np.clip(math.floor(cam.horizon_y) + 2, 0, H))
+
+
 def draw_ground(cam, night=False):
-    img = cv2.warpPerspective(_GRASS, cam.ground_homography(GRASS_MPP, 0, -GRASS_MPP, 0),
-                              (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+    y0 = _first_ground_row(cam)
+    img = np.empty((H, W, 3), np.uint8)
+    img[:] = _sky_colors(night)[0].astype(np.uint8)   # 지면이 없는 곳은 일단 지평선 색 (하늘은 나중에 칠한다)
+    if y0 >= H:   # 위를 올려다봐서 지면이 화면에 없다
+        return img
+    shift = np.array([[1, 0, 0], [0, 1, -y0], [0, 0, 1.0]])   # 지평선 아래 행들만 그린다
+    cv2.warpPerspective(_GRASS, shift @ cam.ground_homography(GRASS_MPP, 0, -GRASS_MPP, 0),
+                        (W, H - y0), dst=img[y0:], flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
     _warp_city(img, cam, scenery.CITY["day"], True)
-    ap = cv2.warpPerspective(_AIRPORT, cam.ground_homography(1 / AP_PPM, AP_X0, -1 / AP_PPM, AP_Y1),
-                             (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(0, 0, 0, 0))
+    ap = np.zeros((H, W, 4), np.uint8)
+    cv2.warpPerspective(_AIRPORT, shift @ cam.ground_homography(1 / AP_PPM, AP_X0, -1 / AP_PPM, AP_Y1),
+                        (W, H - y0), dst=ap[y0:], flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0, 0))
     cv2.copyTo(ap[..., :3], cv2.compare(ap[..., 3], 127, cv2.CMP_GT), img)
     if _wx["snow"]:        # 눈: 지면이 하얗게 덮인다
         img = cv2.addWeighted(img, 0.5, np.full_like(img, 236), 0.5, 0)
@@ -577,6 +629,23 @@ def draw_weather_button(img, weather):
             for dy in (5, 9):
                 cv2.line(img, (cx - 10, cy + dy), (cx + 10, cy + dy), _WEATHER_ICON_COLOR, 1, AA)
     ck.text(img, wx["label"], (x1 + 40, cy + 6), 0.5, WHITE, 2)
+
+
+def draw_cam_button(img, cam):
+    """시점 전환 버튼: 지금 시점(조종사 / 외부)을 보여주고, 누르면 바뀐다."""
+    x1, y1, x2, y2 = CAM_BUTTON
+    pilot = cam == "cockpit"
+    ck.shade(img, x1, y1, x2, y2, (40, 90, 40) if pilot else (110, 70, 50), 0.75)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (230, 230, 230), 1)
+    cx, cy = x1 + 18, (y1 + y2) // 2
+    if pilot:   # 눈 모양
+        cv2.ellipse(img, (cx, cy), (10, 6), 0, 0, 360, WHITE, 1, AA)
+        cv2.circle(img, (cx, cy), 3, WHITE, -1, AA)
+    else:       # 위에서 본 비행기 모양
+        cv2.line(img, (cx, cy - 9), (cx, cy + 8), WHITE, 2, AA)
+        cv2.line(img, (cx - 10, cy), (cx + 10, cy), WHITE, 2, AA)
+        cv2.line(img, (cx - 4, cy + 8), (cx + 4, cy + 8), WHITE, 2, AA)
+    ck.text(img, "PILOT" if pilot else "OUTSIDE", (x1 + 36, cy + 6), 0.5, WHITE, 2)
 
 
 def draw_time_button(img, night):
@@ -902,7 +971,7 @@ def draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night=False, clock=0.0):
         return
     uv = to_px(cam.project(pc))
 
-    if ac.alt < 60.0:   # 낮은 고도에서는 착륙 장치를 내린다
+    if ac.gear_down:   # 착륙 장치가 내려와 있을 때만 그린다 (자동이면 낮은 고도에서)
         scale = FOCAL / max(float(np.linalg.norm(pos - cam.eye)), 1.0)
         for top, wheel in _GEAR:
             g = cam.to_cam(np.array([top, wheel], float) @ rot.T + pos)
@@ -949,8 +1018,8 @@ def draw_trail(img, cam, trail):
 
 # ---------------------------------------------------------------- 화면 조립
 
-HELP_3D = "DRAG/SCROLL/ARROWS: ROTATE   + -: ZOOM   1 3 7 9: VIEW   5: RESET   V: 2D   N: DAY/NIGHT   W: WEATHER"
-HELP_2D = "V: 3D VIEW    N: DAY/NIGHT    W: WEATHER"
+HELP_3D = "DRAG/ARROWS: LOOK  + -: ZOOM  1379: VIEW  5: RESET  A: PILOT/OUTSIDE  V: 2D  N: NIGHT  W: WX  F: FLAPS  G: GEAR"
+HELP_2D = "V: 3D VIEW    N: DAY/NIGHT    W: WEATHER    F: FLAPS    G: GEAR"
 MINIMAP = 170
 _mini = {"img": None, "n": 0}
 
@@ -999,19 +1068,21 @@ def draw_windsocks(img, cam, env):
 def draw_scene(view, sc, ac, trail, fx):
     bank_deg, pitch_deg = fx.bank, fx.pitch
     night = view.night
-    cam = Camera(view, ac)
+    cam = Camera(view, ac, pitch_deg)
+    cockpit = cam.cockpit
     img = draw_ground(cam, night)
     draw_targets(img, cam, sc)
     draw_marks(img, cam, fx)
     if night:
         draw_landing_light(img, cam, ac)   # 밤에는 그림자 대신 착륙등 불빛
-    elif _wx["sun"]:
+    elif _wx["sun"] and not cockpit:
         draw_shadow(img, cam, ac)          # 해가 가려진 날에는 그림자가 없다
     draw_fog_and_sky(img, cam, night)
     wind = fx.env.wind if fx.env is not None and fx.env.wind_speed > 0 else (3.0, -2.5)
     draw_clouds(img, cam, night, fx.clock, wind)
     faces = city_faces(cam, night)
-    plane_depth = float(cam.to_cam([cam.target])[0, 2])
+    # 조종석에서는 자기 기체를 그리지 않으므로 모든 건물을 한 번에 그린다
+    plane_depth = 0.0 if cockpit else float(cam.to_cam([cam.target])[0, 2])
     draw_city(img, faces, farther_than=plane_depth)   # 기체보다 먼 건물
     if night:
         draw_night_lights(img, cam, fx.clock)
@@ -1019,13 +1090,93 @@ def draw_scene(view, sc, ac, trail, fx):
     if fx.env is not None:
         draw_windsocks(img, cam, fx.env)
     draw_trail(img, cam, trail)
-    if ac.alt > 3.0:   # 지면 위 위치를 알 수 있게 수직선
-        line_world(img, cam, (ac.x, ac.y, 0), (ac.x, ac.y, ac.alt + GEAR_HEIGHT - 2), (230, 230, 230), 1)
-    draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night, fx.clock)
-    draw_city(img, faces, nearer_than=plane_depth)    # 기체보다 가까운 건물은 기체를 가린다
-    draw_smoke(img, cam, fx)
+    if not cockpit:
+        if ac.alt > 3.0:   # 지면 위 위치를 알 수 있게 수직선
+            line_world(img, cam, (ac.x, ac.y, 0), (ac.x, ac.y, ac.alt + GEAR_HEIGHT - 2),
+                       (230, 230, 230), 1)
+        draw_aircraft(img, cam, ac, bank_deg, pitch_deg, night, fx.clock)
+        draw_city(img, faces, nearer_than=plane_depth)    # 기체보다 가까운 건물은 기체를 가린다
+        draw_smoke(img, cam, fx)
     draw_lightning(img, fx.clock, cam.horizon_y)
-    return img
+    return apply_motion(img, fx, bank_deg if cockpit else None, ac, night)
+
+
+COCKPIT_ZOOM = 1.3            # 조종석 그림을 돌려도 모서리가 비지 않게 조금 키운다
+COCKPIT_CENTER = (350, 262)   # 앞 유리창의 가운데 (지평선이 놓이는 곳)
+C_FRAME, C_FRAME_EDGE, C_DASH = (40, 38, 36), (78, 76, 72), (30, 29, 28)
+
+
+def apply_motion(img, fx, bank_deg, ac, night=False):
+    """움직임 효과(화면 흔들림)를 입힌다. bank_deg를 주면 조종석 시점: 기울기만큼 바깥 풍경을 돌린다."""
+    dx, dy, rot = fx.motion
+    if bank_deg is None:   # 뒤에서 따라가는 시점
+        if abs(dx) + abs(dy) + abs(rot) < 0.3:
+            return img
+        m = cv2.getRotationMatrix2D((CX, CY), rot, 1.0)
+        m[:, 2] += (dx, dy)
+        return cv2.warpAffine(img, m, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    # 조종석: 오른쪽으로 기울면 바깥 지평선은 반시계 방향으로 돈다. 흔들림은 더 크게 느껴진다
+    m = cv2.getRotationMatrix2D((CX, CY), bank_deg + rot * 1.5, COCKPIT_ZOOM)
+    m[:, 2] += (COCKPIT_CENTER[0] - CX + dx * 1.8, COCKPIT_CENTER[1] - CY + dy * 1.8)
+    out = cv2.warpAffine(img, m, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    draw_cockpit_frame(out, ac, night)
+    return out
+
+
+def draw_cockpit_frame(img, ac, night=False):
+    """조종석 내부: 창틀, 가운데 기둥, 계기판 덮개와 그 아래 패널."""
+    k = 0.55 if night else 1.0
+    frame = tuple(int(c * k) for c in C_FRAME)
+    edge = tuple(int(c * k) for c in C_FRAME_EDGE)
+    dash = tuple(int(c * k) for c in C_DASH)
+    poly = lambda pts, color: cv2.fillPoly(img, [np.array(pts, np.int32)], color, AA)
+    poly([(0, 0), (W, 0), (W, 26), (560, 38), (140, 38), (0, 26)], frame)            # 위쪽 창틀
+    poly([(0, 0), (74, 0), (44, 476), (0, 490)], frame)                             # 왼쪽 기둥
+    poly([(W, 0), (W - 74, 0), (W - 44, 476), (W, 490)], frame)                     # 오른쪽 기둥
+    poly([(343, 34), (357, 34), (361, 462), (339, 462)], frame)                     # 가운데 기둥
+    for a, b in (((74, 0), (44, 476)), ((W - 74, 0), (W - 44, 476)), ((140, 38), (560, 38)),
+                 ((343, 34), (339, 462)), ((357, 34), (361, 462))):
+        cv2.line(img, a, b, edge, 1, AA)
+    # 계기판 덮개 (윗면이 살짝 볼록하다)와 그 아래 패널
+    top = [(0, 486)] + [(x, int(462 + 24 * ((x - 350) / 350) ** 2)) for x in range(0, W + 1, 50)] + [(W, 486)]
+    poly(top + [(W, H), (0, H)], dash)
+    cv2.polylines(img, [np.array(top[1:-1], np.int32)], False, edge, 2, AA)
+
+    # 자동 비행 조작판 모양의 숫자 창: 속도, 방위, 고도, 상승률
+    readouts = (("SPD", f"{ac.speed:03.0f}"), ("HDG", f"{ac.heading % 360:03.0f}"),
+                ("ALT", f"{ac.alt:04.0f}"), ("V/S", f"{ac.vs:+04.1f}"))
+    for i, (label, value) in enumerate(readouts):
+        x = 78 + i * 104
+        cv2.rectangle(img, (x, 500), (x + 88, 530), (12, 12, 12), -1)
+        cv2.rectangle(img, (x, 500), (x + 88, 530), edge, 1)
+        ck.text(img, label, (x + 5, 512), 0.3, (150, 150, 150))
+        ck.text(img, value, (x + 82, 525), 0.55, (90, 230, 90), 1, "r")
+
+    # 엔진 계기 (추력 바늘), 플랩 위치, 착륙 장치 표시등
+    cx, cy, r = 110, 600, 42
+    cv2.circle(img, (cx, cy), r, (14, 14, 14), -1, AA)
+    cv2.circle(img, (cx, cy), r, edge, 1, AA)
+    n1 = 0.0 if ac.engine_failed else min(ac.speed / 70.0, 1.0)
+    for frac in np.linspace(0, 1, 11):
+        a = math.radians(210 - 240 * frac)
+        cv2.line(img, (int(cx + (r - 6) * math.cos(a)), int(cy - (r - 6) * math.sin(a))),
+                 (int(cx + (r - 1) * math.cos(a)), int(cy - (r - 1) * math.sin(a))), (200, 200, 200), 1, AA)
+    a = math.radians(210 - 240 * n1)
+    cv2.line(img, (cx, cy), (int(cx + (r - 9) * math.cos(a)), int(cy - (r - 9) * math.sin(a))),
+             (60, 60, 235) if ac.engine_failed else (245, 245, 245), 2, AA)
+    ck.text(img, "ENG", (cx, cy + 22), 0.36, (60, 60, 235) if ac.engine_failed else (150, 150, 150), 1, "c")
+    ck.text(img, "FLAPS", (190, 566), 0.36, (150, 150, 150))
+    for i, name in enumerate(("UP", "1", "2", "FULL")):
+        on = i == ac.flaps
+        cv2.rectangle(img, (190 + i * 44, 574), (228 + i * 44, 596), (30, 120, 30) if on else (14, 14, 14), -1)
+        cv2.rectangle(img, (190 + i * 44, 574), (228 + i * 44, 596), edge, 1)
+        ck.text(img, name, (209 + i * 44, 590), 0.36, (245, 245, 245) if on else (120, 120, 120), 1, "c")
+    ck.text(img, "GEAR", (190, 622), 0.36, (150, 150, 150))
+    for i in range(3):   # 세 바퀴: 내려와 있으면 초록, 올라가 있으면 꺼짐
+        cv2.circle(img, (203 + i * 30, 640), 9, (70, 220, 70) if ac.gear_down else (24, 24, 24), -1, AA)
+        cv2.circle(img, (203 + i * 30, 640), 9, edge, 1, AA)
+    ck.text(img, "DOWN" if ac.gear_down else "UP", (296, 645), 0.4,
+            (70, 220, 70) if ac.gear_down else (0, 190, 255))
 
 
 def render(view, sc, ac, trail, ctrl, cam_frame, hand, phase, t, info, fx):
@@ -1051,6 +1202,7 @@ def render(view, sc, ac, trail, ctrl, cam_frame, hand, phase, t, info, fx):
     draw_precipitation(scene, fx.clock)
     ck.draw_overlays(scene, sc, ac, phase, t, info, fx)
     draw_time_button(scene, view.night)
+    draw_cam_button(scene, view.cam)
     draw_weather_button(scene, view.weather)
     if info.get("hint"):   # 모드별 추가 조작 안내 (예: 자유 비행의 R 키)
         help_text += "    " + info["hint"]

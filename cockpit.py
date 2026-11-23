@@ -11,6 +11,7 @@
 """
 
 import math
+import random
 import time
 
 import cv2
@@ -18,7 +19,7 @@ import numpy as np
 
 import scenery
 
-from flight_sim import LAND_MAX_SINK, MAX_VS, RUNWAY_HALF_WIDTH, RUNWAY_LENGTH, V_LEVEL
+from flight_sim import FLAP_NAMES, LAND_MAX_SINK, MAX_VS, RUNWAY_HALF_WIDTH, RUNWAY_LENGTH, V_LEVEL
 
 CANVAS_W, CANVAS_H = 1000, 700
 MAP_W = 700                      # 지도 영역 너비, 나머지는 계기판
@@ -395,10 +396,31 @@ def draw_overlays(m, sc, ac, phase, t, info, fx=None):
         if getattr(sc, "progress", None) is not None:   # 장주 진행률
             cv2.rectangle(m, (10, 128), (292, 131), (70, 70, 70), -1)
             cv2.rectangle(m, (10, 128), (10 + int(282 * sc.progress), 131), MAGENTA, -1)
-        # 실속 경고 (깜빡임), 이륙·접지 알림과 고도 호출 (잠깐 크게 표시)
+        # 기체 계통: 플랩, 착륙 장치, 엔진
+        shade(m, 10, 134, 292, 158)
+        cv2.rectangle(m, (10, 134), (292, 158), DIM, 1)
+        text(m, f"FLAPS {FLAP_NAMES[ac.flaps]}", (20, 151), 0.45, WHITE if ac.flaps else GRAY)
+        gear = "DOWN" if ac.gear_down else "UP"
+        # 자동일 때 높은 고도에서 올라가 있는 것은 정상이므로 눈에 띄지 않게, 수동으로 올렸으면 주황색
+        text(m, f"GEAR {gear}" + (" AUTO" if ac.gear_auto else ""), (150, 151), 0.45,
+             GREEN if ac.gear_down else (GRAY if ac.gear_auto else AMBER), 1, "c")
+        text(m, "ENG FAIL" if ac.engine_failed else "ENG OK", (282, 151), 0.45,
+             RED if ac.engine_failed else GRAY, 1, "r")
+        if info.get("ios") is not None:   # 교관석: 지금 걸려 있는 상황과 조작 키
+            shade(m, 10, 162, 292, 200)
+            cv2.rectangle(m, (10, 162), (292, 200), DIM, 1)
+            text(m, "IOS", (20, 178), 0.45, CYAN)
+            text(m, "  ".join(info["ios"]) or "NORMAL", (282, 178), 0.45,
+                 AMBER if info["ios"] else GRAY, 1, "r")
+            text(m, "P FREEZE  X ENG  T GUST  A FINAL  H HIGH", (20, 194), 0.33, GRAY)
+        # 경고 (깜빡임): 실속, 낮은 고도에서 착륙 장치가 올라가 있음. 그다음 이륙·접지 알림과 고도 호출
+        blink = int(fx.clock * 4) % 2 == 0
         if ac.airborne and ac.stalled and phase != "ready":
-            if int(fx.clock * 4) % 2 == 0:
+            if blink:
                 fit_text(m, "STALL", cx, 175, 1.5, RED, 3, MAP_W - 30)
+        elif ac.airborne and not ac.gear_down and ac.alt < 50.0 and ac.vs < -0.5:
+            if blink:
+                fit_text(m, "TOO LOW - GEAR", cx, 175, 1.2, AMBER, 3, MAP_W - 30)
         elif fx.callout and phase != "ready":
             word, color = fx.callout
             fit_text(m, word, cx, 175, 1.3, color, 3, MAP_W - 30)
@@ -627,8 +649,16 @@ class FlightEffects:
     CALLOUT_ALTS = (50, 30, 20, 10)
     SMOKE_SECONDS = 2.2
 
-    def __init__(self, ac, ctrl, env=None):
+    def __init__(self, ac, ctrl, env=None, motion=True):
         self.env = env           # 바람·난기류 (없으면 None). 풍향 표시와 흔들림에 쓴다
+        # 움직임 효과: 실제 훈련 시뮬레이터의 모션 장치를 화면 흔들림으로 흉내 낸다
+        self.motion_enabled = motion
+        self.motion = (0.0, 0.0, 0.0)   # 화면을 밀 양 (가로 px, 세로 px)과 돌릴 각(도)
+        self._rng = random.Random(3)
+        self._prev_speed = ac.speed
+        self._accel = 0.0
+        self._bump = 0.0         # 접지 충격의 세기
+        self._bump_t = -1e9
         self.clock = 0.0
         self.liftoff = None      # (x, y)
         self.touchdown = None    # (x, y)
@@ -646,6 +676,7 @@ class FlightEffects:
         elif event == "touchdown":
             self.touchdown, self._touchdown_t = (ac.x, ac.y), self.clock
             self._say("TOUCHDOWN", WHITE, 1.8)
+            self._bump, self._bump_t = min(max(-ac.vs, 0.5), 7.0), self.clock
             h = math.radians(ac.heading)   # 주 착륙 장치 두 바퀴 위치에 연기
             for side in (-2.8, 2.8):
                 self._puffs.append((ac.x + side * math.cos(h) - 1.5 * math.sin(h),
@@ -664,6 +695,34 @@ class FlightEffects:
             pitch += 1.5 * self.env.updraft(ac.alt)
         self.bank += (bank - self.bank) * min(dt / 0.15, 1.0)
         self.pitch += (pitch - self.pitch) * min(dt / 0.45, 1.0)
+        self._update_motion(ac, dt)
+
+    def _update_motion(self, ac, dt):
+        """가속·감속, 난기류, 접지 충격, 활주 진동, 실속 떨림을 화면 움직임으로 바꾼다."""
+        if dt > 0:
+            accel = (ac.speed - self._prev_speed) / dt
+            self._accel += (accel - self._accel) * min(dt / 0.4, 1.0)
+        self._prev_speed = ac.speed
+        if not self.motion_enabled:
+            self.motion = (0.0, 0.0, 0.0)
+            return
+        shake = self._rng.uniform
+        dx = dy = rot = 0.0
+        dy += 1.3 * float(np.clip(self._accel, -4.0, 4.0))   # 가속하면 몸이 뒤로 밀려 앞이 들려 보인다
+        since = self.clock - self._bump_t                     # 접지 충격: 쿵 하고 잦아드는 흔들림
+        if since < 1.5:
+            dy += 6.0 * self._bump * math.exp(-since / 0.3) * math.cos(20.0 * since)
+        speed_over_ground = ac.ground_speed if ac.physical else ac.speed
+        if not ac.airborne and speed_over_ground > 3.0:       # 활주로를 달릴 때의 잔진동
+            k = min(speed_over_ground / 30.0, 1.4)
+            dx, dy = dx + shake(-0.7, 0.7) * k, dy + shake(-1.4, 1.4) * k
+        if ac.airborne and ac.stalled:                         # 실속 떨림
+            dx, dy, rot = dx + shake(-3, 3), dy + shake(-3, 3), rot + shake(-0.5, 0.5)
+        if self.env is not None and ac.airborne:               # 난기류
+            h = math.radians(ac.heading)
+            side = self.env.gust[0] * math.cos(h) - self.env.gust[1] * math.sin(h)
+            dx, dy, rot = dx + 2.0 * side, dy + 3.5 * self.env.updraft(ac.alt), rot + 0.5 * side
+        self.motion = (dx, dy, rot)
 
     def _say(self, word, color, seconds):
         self._callout = (word, color, self.clock + seconds)

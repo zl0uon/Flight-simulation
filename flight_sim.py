@@ -19,6 +19,11 @@ cv2에 의존하지 않으므로 카메라 없이 테스트할 수 있다.
     - 지면 효과: 지면 가까이에서는 하강이 완만해진다.
     - 바람: 대기속도와 대지속도가 달라지고 옆바람에 밀린다. 지상에서는 기수가 바람 쪽으로 돈다.
     - 난기류: 시간에 따라 이어지는 무작위 돌풍(앞뒤·좌우·상하)이 속도·위치·상승률을 흔든다.
+
+기체 계통 (Aircraft의 flaps / gear / engine_failed)
+    플랩을 내리면 더 느린 속도로 날고 뜰 수 있지만 항력이 늘어난다. 착륙 장치는 기본이 자동이고,
+    수동으로 올린 채 접지하면 착륙 실패다. 엔진이 고장 나면 추력 없이 활공한다.
+    기본 상태에서는 아무 영향이 없어서, 건드리지 않으면 계통이 없던 때와 똑같이 움직인다.
 """
 
 import math
@@ -51,6 +56,13 @@ GROUND_EFFECT_ALT = 8.0  # 이 고도 아래에서 지면 효과 (m)
 GROUND_EFFECT_MIN = 0.7  # 지면에서 하강률에 곱해지는 값
 WEATHERVANE_GAIN = 0.15  # 지상 활주 중 옆바람 1 m/s당 기수가 바람 쪽으로 도는 비율 (deg/s)
 GUST_TAU = 2.5           # 돌풍이 이어지는 시간 척도 (s)
+# 플랩 단계별: (수평 비행에 필요한 속도가 줄어드는 양, 실속 속도가 줄어드는 양, 늘어나는 항력 m/s^2)
+# 플랩을 내리면 더 느리게 날 수 있지만 항력이 커진다. 0단(UP)은 아무 효과가 없다.
+FLAPS = [(0.0, 0.0, 0.0), (3.0, 2.0, 0.25), (6.0, 4.0, 0.5), (9.0, 6.0, 0.9)]
+FLAP_NAMES = ["UP", "1", "2", "FULL"]
+GEAR_AUTO_ALT = 60.0     # 착륙 장치 자동일 때 이 고도 아래에서 내려온다 (m)
+GEAR_DRAG = 0.3          # 높은 고도에서 착륙 장치를 내려 두었을 때 늘어나는 항력 (m/s^2)
+GLIDE_DRAG = 0.9         # 엔진이 꺼졌을 때의 감속 (m/s^2). 활공비 약 11:1
 ROTATE_MARGIN = 2.0      # 이륙은 V_LEVEL보다 이만큼 빨라야 한다 (돌풍에 다시 내려앉지 않도록, m/s)
 UPDRAFT_FULL_ALT = 20.0  # 상하 돌풍이 온전히 작용하는 고도 (지면에서는 0: 공기가 땅을 뚫지 못한다)
 
@@ -129,6 +141,26 @@ class Aircraft:
     stalled: bool = False
     physical: bool = False     # 환경 모델로 움직이는 중인지 (화면 표시용)
     _gust_along: float = 0.0
+    # 기체 계통. 기본값(플랩 UP, 착륙 장치 자동, 엔진 정상)이면 계통이 없던 때와 똑같이 움직인다
+    flaps: int = 0             # 플랩 단계 0~3 (FLAP_NAMES)
+    gear_auto: bool = True     # 착륙 장치 자동: 지상이거나 낮은 고도면 내려와 있다
+    gear_lever_down: bool = True   # 수동일 때의 레버 위치
+    engine_failed: bool = False
+
+    @property
+    def gear_down(self) -> bool:
+        if self.gear_auto:
+            return not self.airborne or self.alt < GEAR_AUTO_ALT
+        return self.gear_lever_down
+
+    def toggle_gear(self):
+        """착륙 장치 레버를 반대로. 처음 누르면 자동에서 수동으로 넘어간다 (지상에서는 올리지 않는다)."""
+        down = self.gear_down
+        self.gear_auto = False
+        self.gear_lever_down = True if not self.airborne else not down
+
+    def next_flaps(self):
+        self.flaps = (self.flaps + 1) % len(FLAPS)
 
     def step(self, roll: float, throttle: float, dt: float, env: "Environment" = None,
              pitch: float = 0.0):
@@ -140,6 +172,8 @@ class Aircraft:
         pitch = max(-1.0, min(1.0, pitch))
         if env is not None:
             return self._step_physical(roll, throttle, dt, env, pitch)
+        if self.engine_failed:   # 단순 모델에서는 엔진 고장 = 추력 없음
+            throttle = 0.0
         target_v = V_MAX * throttle / 100.0
         self.speed += (target_v - self.speed) * min(dt / SPEED_TAU, 1.0)
 
@@ -171,6 +205,13 @@ class Aircraft:
         env.step(self.alt, dt)
         target_v = V_MAX * throttle / 100.0
         thrust = max(-MAX_DECEL, min(MAX_ACCEL, (target_v - self.speed) / SPEED_TAU))
+        less_level, less_stall, flap_drag = FLAPS[self.flaps]
+        if self.engine_failed:   # 엔진 고장: 추력 없이 항력만 남는다 (공중에서는 활공)
+            thrust = -GLIDE_DRAG if self.airborne else -1.0
+        # 플랩과, 높은 고도에서 내려 둔 착륙 장치의 항력 (속도의 제곱에 비례)
+        extra_drag = flap_drag + (GEAR_DRAG if self.airborne and self.gear_down
+                                  and self.alt >= GEAR_AUTO_ALT else 0.0)
+        thrust -= extra_drag * (self.speed / V_LEVEL) ** 2
 
         if not self.airborne:
             # --- 지상: 바퀴가 대지속도를 정하고, 대기속도 = 대지속도 + 맞바람 ---
@@ -189,9 +230,10 @@ class Aircraft:
             self.vs = 0.0
             self.stalled = False
             # 양력이 무게를 충분히 넘으면 뜬다. pitch를 당기면(기수 들기) 조금 낮은 속도에서도 뜬다
-            if self.speed > V_LEVEL + ROTATE_MARGIN - PITCH_ROTATE * max(pitch, 0.0):
+            # 플랩을 내리면 그만큼 낮은 속도에서 뜬다
+            if self.speed > V_LEVEL - less_level + ROTATE_MARGIN - PITCH_ROTATE * max(pitch, 0.0):
                 self.airborne = True
-                self.vs = max(CLIMB_GAIN * (self.speed - V_LEVEL) + PITCH_CLIMB * pitch, 0.3)
+                self.vs = max(CLIMB_GAIN * (self.speed - V_LEVEL + less_level) + PITCH_CLIMB * pitch, 0.3)
                 self.alt += self.vs * dt
                 self._gust_along = env.along(self.heading, gust_only=True)
                 return "liftoff"
@@ -211,11 +253,12 @@ class Aircraft:
         self.speed = max(self.speed, 0.0)
 
         # 상승률: 기울일수록 수평 비행에 필요한 속도가 올라간다 (하중배수 1/cos(뱅크))
-        v_level = V_LEVEL / math.sqrt(max(math.cos(bank), 0.3))
+        v_level = (V_LEVEL - less_level) / math.sqrt(max(math.cos(bank), 0.3))
         vs_target = CLIMB_GAIN * (self.speed - v_level) + PITCH_CLIMB * pitch
-        self.stalled = self.speed < V_STALL
+        v_stall = V_STALL - less_stall
+        self.stalled = self.speed < v_stall
         if self.stalled:
-            vs_target -= STALL_SINK_GAIN * (V_STALL - self.speed)
+            vs_target -= STALL_SINK_GAIN * (v_stall - self.speed)
         if vs_target < 0.0 and self.alt < GROUND_EFFECT_ALT:   # 지면 효과
             vs_target *= GROUND_EFFECT_MIN + (1.0 - GROUND_EFFECT_MIN) * self.alt / GROUND_EFFECT_ALT
         vs_target = max(-MAX_SINK, min(MAX_VS, vs_target))
@@ -378,6 +421,8 @@ def landing_faults(ac: Aircraft, sink: float) -> list:
         reasons.append(f"too fast {ac.speed:.0f} m/s")
     if abs(ac.x) > LAND_MAX_OFFSET:
         reasons.append(f"off centerline {ac.x:+.1f} m")
+    if not ac.gear_down:   # 착륙 장치를 수동으로 올린 채 접지 (자동이면 항상 내려와 있다)
+        reasons.append("gear up landing")
     return reasons
 
 
