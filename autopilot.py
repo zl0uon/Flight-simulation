@@ -51,6 +51,8 @@ class Autopilot:
         """사람에게 안내할 목표 고도 (m). 안내할 고도가 없으면 None."""
         if hasattr(sc, "target_alt"):
             return sc.target_alt
+        if hasattr(sc, "guide_alt"):   # 항로 비행의 출발·도착 구간
+            return sc.guide_alt(ac)
         if sc.name == "takeoff":
             return sc.TARGET_ALT + 20.0 if ac.airborne else None
         final = sc.name == "landing" or (sc.name == "circuit" and sc.idx >= sc.final_idx - 100)
@@ -116,6 +118,8 @@ class Autopilot:
         return 25 if (too_high or ac.y > AIM_Y - 50.0) else 50
 
     def _throttle(self, sc, ac):
+        if hasattr(sc, "throttle_plan"):   # 항로 비행의 출발·도착 구간은 과제가 추력 계획을 정한다
+            return sc.throttle_plan(self, ac)
         if sc.name == "takeoff":
             return 100
         if sc.name == "landing":

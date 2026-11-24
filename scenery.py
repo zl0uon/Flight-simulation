@@ -104,10 +104,17 @@ class Builder:
         cv2.polylines(self.img, [p], False, color, length_px(width), AA)
         if line is not None:
             cv2.polylines(self.img, [p], False, line, 1, AA)
+        # 가로등: 실제 도로처럼 길 양옆에 번갈아 세운다 (한쪽에 lamp_step 간격, 맞은편은 반 칸 어긋나게)
+        side = width / 2 + 1.5
         for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
-            n = max(int(math.hypot(x2 - x1, y2 - y1) / lamp_step), 1)
-            for k in range(n + 1):
-                self.lamps.append((x1 + (x2 - x1) * k / n, y1 + (y2 - y1) * k / n, lamp_color))
+            seg = math.hypot(x2 - x1, y2 - y1)
+            if seg < 1.0:
+                continue
+            nx, ny = -(y2 - y1) / seg * side, (x2 - x1) / seg * side
+            n = max(int(seg / lamp_step), 1)
+            for k in range(2 * n + 1):
+                t, sign = k / (2 * n), (1 if k % 2 == 0 else -1)
+                self.lamps.append((x1 + (x2 - x1) * t + sign * nx, y1 + (y2 - y1) * t + sign * ny, lamp_color))
 
     def tree(self, x, y, r=4.0):
         c = px(x, y)
@@ -408,12 +415,15 @@ class Builder:
         for x1, y1, x2, y2, roof in self.roofs:
             self.rect(x1, y1, x2, y2, roof)
 
-        # 밤 불빛: 가로등은 작은 점 + 번진 빛
-        for x, y, color in self.lamps:
-            if X0 < x < X1 and Y0 < y < Y1:
-                cv2.circle(self.emission, px(x, y), 1, color, -1)
+        # 밤 불빛: 창문 등은 조금 번지게 하고, 가로등은 등 아래 길바닥에 고인 은은한 빛으로 그린다
+        # (등 자체는 3D 화면이 기둥 높이의 작은 점으로 따로 그린다)
         glow = cv2.GaussianBlur(self.emission, (0, 0), 3.0)
         self.emission = cv2.add(self.emission, cv2.convertScaleAbs(glow, alpha=2.2))
+        pools = np.zeros_like(self.emission)
+        self.lamps = [(x, y, c) for x, y, c in self.lamps if X0 < x < X1 and Y0 < y < Y1]
+        for x, y, color in self.lamps:
+            cv2.circle(pools, px(x, y), 3, tuple(int(v * 0.55) for v in color), -1, AA)
+        self.emission = cv2.add(self.emission, cv2.GaussianBlur(pools, (0, 0), 2.0))
         return self
 
 
@@ -424,13 +434,23 @@ def _levels(img):
 
 
 def _make_boxes(boxes):
-    """입체 건물 상자들을 면 단위 배열로 바꾼다 (그릴 때 한꺼번에 계산하기 위해)."""
+    """축에 나란한 상자들 (x1, y1, x2, y2, 바닥, 꼭대기, 벽 색, 지붕 색, 불빛)을 면 단위 배열로 바꾼다."""
+    return make_prisms([([(x1, y1), (x2, y1), (x2, y2), (x1, y2)], z0, z1, wall, roof, lit)
+                        for x1, y1, x2, y2, z0, z1, wall, roof, lit in boxes])
+
+
+def make_prisms(prisms):
+    """입체 건물들을 면 단위 배열로 바꾼다 (그릴 때 한꺼번에 계산하기 위해).
+
+    prisms = (바닥 네 꼭짓점 (반시계 방향), 바닥 높이, 꼭대기 높이, 벽 색, 지붕 색, 불빛 0~1) 목록.
+    """
     sun = np.array([-0.42, 0.9])   # 햇빛이 오는 수평 방향 (북서)
     sun /= np.linalg.norm(sun)
     verts, normals, day, night, owner = [], [], [], [], []
     centers, heights, beacons = [], [], []
-    for i, (x1, y1, x2, y2, z0, z1, wall, roof, lit) in enumerate(boxes):
-        c = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    for i, (c, z0, z1, wall, roof, lit) in enumerate(prisms):
+        x1, y1 = np.min(c, axis=0)
+        x2, y2 = np.max(c, axis=0)
         centers.append(((x1 + x2) / 2, (y1 + y2) / 2, (z0 + z1) / 2))
         heights.append(z1)
         glow = np.array([70, 150, 215]) * lit   # 창문 불빛 (따뜻한 색)
@@ -451,6 +471,8 @@ def _make_boxes(boxes):
             owner.append(i)
         if z1 > 85 and z0 == 0.0:
             beacons.append(((x1 + x2) / 2, (y1 + y2) / 2, z1 + 2.0))
+    if not verts:
+        return None
     return {
         "verts": np.array(verts, float), "normals": np.array(normals, float),
         "day": np.clip(np.array(day), 0, 255), "night": np.clip(np.array(night), 0, 255),
@@ -459,6 +481,7 @@ def _make_boxes(boxes):
     }
 
 
+LAMP_HEIGHT = 9.0   # 가로등 높이 (m)
 GRASS_MPP = 2.0   # 잔디 질감 1픽셀 = 2 m, 500픽셀(1 km)마다 반복
 
 
@@ -489,7 +512,9 @@ def build():
     """도시를 만든다."""
     b = Builder(GRASS_TILE).build()
     return {"day": _levels(b.img), "emission": _levels(b.emission), "boxes": _make_boxes(b.boxes),
-            "count": len(b.boxes)}
+            "count": len(b.boxes),
+            "lamps": np.array([(x, y, LAMP_HEIGHT) for x, y, _c in b.lamps], float).reshape(-1, 3),
+            "lamp_colors": np.array([c for _x, _y, c in b.lamps], np.float32).reshape(-1, 3)}
 
 
 GRASS_TILE = _make_grass()

@@ -582,6 +582,136 @@ class Route(PathScenario):
             self.finish("success", t=t)
 
 
+class Departure(PathScenario):
+    """항로 비행의 출발: 이륙 -> 상승하면서 항로 방향으로 선회 -> 항로에 올라서면 끝 (순항으로 이어진다)."""
+    name = "departure"
+    instruction = ""
+    timeout = None
+    view_scale = 0.3
+    RADIUS = 450.0
+    TURN_Y = 1800.0       # 이륙 후 선회를 시작하는 지점
+    CLIMB_ALT = 350.0     # 출발 구간에서 올라가는 고도 (m)
+
+    def __init__(self, bearing_deg):
+        super().__init__()
+        turn = (bearing_deg + 180.0) % 360.0 - 180.0   # 북쪽(활주로 방향)에서 항로 방향까지 돌 각도
+        legs = [("s", self.TURN_Y)]
+        if abs(turn) > 1.0:
+            legs.append(("r" if turn > 0 else "l", abs(turn), self.RADIUS))
+        legs.append(("s", 2500.0))
+        self.outline = _turtle_path((0.0, 0.0), 0.0, legs, 6.0)
+        self.path = _resample(_turtle_path((0.0, 0.0), 0.0, legs, 2.0), self.STEP)
+        self.idx = 5
+        self.lifted = False
+
+    @property
+    def progress(self):
+        return self.idx / (len(self.path) - 1)
+
+    def initial_aircraft(self):
+        return Aircraft(x=0.0, y=50.0, heading=0.0, speed=0.0, alt=0.0, airborne=False)
+
+    def targets(self):
+        return [("path", self.outline)]
+
+    def throttle_plan(self, autopilot, ac):
+        if not self.lifted or ac.alt < 60.0:
+            return 100
+        return autopilot._hold(ac, self.CLIMB_ALT)
+
+    def guide_alt(self, ac):
+        """사람이 조종할 때 안내할 고도. 뜨기 전에는 안내하지 않는다."""
+        return self.CLIMB_ALT if ac.airborne else None
+
+    def update(self, ac, event, t):
+        self.idx = max(self.idx, self._nearest(ac)[0])
+        if event == "liftoff":
+            self.lifted = True
+        elif event == "touchdown":
+            self.finish("fail", "ground contact after liftoff")
+        elif not self.lifted and not ac.airborne and abs(ac.x) > RUNWAY_HALF_WIDTH:
+            self.finish("fail", "runway excursion")
+        elif not self.lifted and not ac.airborne and ac.y > RUNWAY_LENGTH:
+            self.finish("fail", "runway overrun")
+        elif self.idx >= len(self.path) - 2:
+            self.finish("success", t=t)
+
+
+class Arrival(PathScenario):
+    """항로 비행의 도착: 항로에서 오던 방향 그대로 들어와 활주로 방향으로 선회 -> 최종 접근 -> 착륙.
+
+    성공 기준은 착륙 과제와 같다. 시작 위치는 들어오는 방향에 맞춰 정한다: 직선으로 조금 날다가
+    한 번 선회하면 활주로 연장선(최종 접근 시작점)에 정확히 올라서는 자리다.
+    """
+    name = "arrival"
+    instruction = ""
+    timeout = None
+    view_scale = 0.3
+    RADIUS = 450.0
+    LEAD_IN = 800.0        # 선회 전에 직선으로 나는 거리
+    FINAL_Y = -3200.0      # 최종 접근이 시작되는 지점 (활주로 시단에서 남쪽으로 3.2 km)
+    ALT = 250.0            # 접근 전까지 유지하는 고도
+
+    def __init__(self, heading_deg):
+        super().__init__()
+        self.heading = heading_deg % 360.0
+        turn = (-self.heading + 180.0) % 360.0 - 180.0   # 들어오는 방향에서 북쪽(활주로 방향)까지 돌 각도
+        legs = [("s", self.LEAD_IN)]
+        if abs(turn) > 1.0:
+            legs.append(("r" if turn > 0 else "l", abs(turn), self.RADIUS))
+        ex, ey = _turtle_path((0.0, 0.0), self.heading, legs, 2.0)[-1]
+        start = (-ex, self.FINAL_Y - ey)              # 선회를 마친 점이 최종 접근 시작점에 오도록
+        before_final = len(_resample(_turtle_path(start, self.heading, legs, 2.0), self.STEP))
+        legs.append(("s", RUNWAY_LENGTH - self.FINAL_Y))
+        self.outline = _turtle_path(start, self.heading, legs, 6.0)
+        self.path = _resample(_turtle_path(start, self.heading, legs, 2.0), self.STEP)
+        self.final_idx = before_final
+        self.idx = 0
+        self.lifted = True
+
+    @property
+    def progress(self):
+        return min(self.idx / self.final_idx, 1.0)
+
+    def initial_aircraft(self):
+        x, y = self.path[0]
+        return Aircraft(x=x, y=y, heading=self.heading, speed=V_LEVEL, alt=self.ALT, airborne=True)
+
+    def targets(self):
+        return [("path", self.outline)]
+
+    def throttle_plan(self, autopilot, ac):
+        if self.idx < self.final_idx:
+            return autopilot._hold(ac, self.ALT)
+        return autopilot._approach(ac)
+
+    GLIDE_SLOPE = 0.08   # 최종 접근 강하 기울기 (자동 조종과 같은 값)
+    AIM_Y = 150.0        # 겨냥하는 접지 지점
+
+    def guide_alt(self, ac):
+        """사람이 조종할 때 안내할 고도: 최종 접근 전에는 ALT, 그 뒤로는 강하 경로."""
+        return min(self.ALT, max(self.GLIDE_SLOPE * (self.AIM_Y - ac.y), 0.0))
+
+    def update(self, ac, event, t):
+        self.idx = max(self.idx, self._nearest(ac)[0])
+        if event != "touchdown":
+            return
+        sink = -ac.vs
+        self.touchdown = {"sink": sink, "speed": ac.speed, "offset": ac.x, "y": ac.y}
+        self.reached_time = t
+        reasons = landing_faults(ac, sink)
+        if self.idx < self.final_idx:
+            self.finish("fail", "landed before the final approach")
+        elif reasons:
+            self.finish("fail", ", ".join(reasons))
+        else:
+            self.finish("success", t=t)
+
+    @property
+    def landing_success(self):
+        return self.outcome == "success"
+
+
 class Circuit(PathScenario):
     """장주 비행: 이륙 -> 상승 -> 오른쪽 선회 -> 배풍 구간 -> 오른쪽 선회 -> 최종 접근 -> 착륙.
 

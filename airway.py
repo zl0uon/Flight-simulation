@@ -62,7 +62,8 @@ def search_airports(text, limit=12):
 CRUISE_SPEED = 250.0     # 순항 속도 (m/s, 약 900 km/h)
 CLIMB_SPEED = 140.0      # 상승 초기·접근 속도 (m/s)
 START_ALT = 100.0        # 순항 구간이 시작되는 고도 (이륙 과제가 끝나는 고도, m)
-END_ALT = 600.0          # 순항 구간이 끝나는 고도 (그 뒤는 착륙 과제, m)
+END_ALT = 250.0          # 순항 구간이 끝나는 고도 (그 뒤는 도착 구간, m)
+END_SPEED = 60.0         # 순항 구간이 끝날 때의 속도 (m/s)
 JETSTREAM = 28.0         # 동쪽으로 갈 때 받는 평균 뒷바람 (m/s). 서쪽으로 가면 맞바람
 
 
@@ -117,6 +118,9 @@ class Route:
         # 순항 구간을 화면에서 보여주는 시간 (초): 장거리 150초, 단거리 60초
         self.show_seconds = float(np.clip(self.distance / 60.0, 60.0, 150.0))
         self.points = [self.position(i / 200) for i in range(201)]   # 지도에 그릴 경로
+        # 순항 구간이 시작·끝나는 고도와 속도 (출발 구간에서 넘겨받고, 도착 구간으로 넘겨준다)
+        self.start_alt, self.start_speed = START_ALT, CLIMB_SPEED
+        self.end_alt, self.end_speed = END_ALT, END_SPEED
 
     def position(self, frac):
         """경로의 frac(0~1) 지점의 (위도, 경도 -180~180)."""
@@ -146,11 +150,12 @@ class Route:
         return self._profile(km)
 
     def altitude(self, km):
-        base = START_ALT if km < self.distance / 2 else END_ALT
+        base = self.start_alt if km < self.distance / 2 else self.end_alt
         return base + (self.cruise_alt - base) * self._profile(km)
 
     def airspeed(self, km):
-        return CLIMB_SPEED + (CRUISE_SPEED - CLIMB_SPEED) * self._profile(km)
+        base = self.start_speed if km < self.distance / 2 else self.end_speed
+        return base + (CRUISE_SPEED - base) * self._profile(km)
 
     def ground_speed(self, km):
         wind = JETSTREAM * self._profile(km)   # 제트기류는 높은 고도에서만 분다

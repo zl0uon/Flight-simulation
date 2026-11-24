@@ -57,8 +57,10 @@
 import argparse
 import csv
 import math
+import os
 import random
 import re
+import sys
 import threading
 import time
 from datetime import datetime
@@ -71,13 +73,40 @@ from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
 from flight_sim import (DEFAULT_WIND_FROM, ENVIRONMENTS, SCENARIO_ALL, SCENARIO_ORDER, SCENARIOS,
-                        Aircraft, Environment, FreeFlight)
-from autopilot import Autopilot
+                        Aircraft, Arrival, Departure, Environment, FreeFlight)
+from autopilot import Autopilot, wrap
 import airway
 import cockpit as ck
 from cockpit import FlightEffects
 from hand_tracking import (FlightController, draw_hand, ensure_model, forbid_frame_saving)
-from view3d import WEATHERS, View, normalize_key, render
+import satellite
+import view3d
+from view3d import WEATHERS, View, normalize_key
+
+_scenery = None   # 위성 사진 지면 (satellite.Scenery). --scenery model 이면 None이고 모형 풍경만 쓴다
+
+
+def render(view, sc, ac, trail, ctrl, cam, hand, phase, t, info, fx):
+    """한 프레임을 그린다 (view3d.render). 위성 사진 지면을 쓰는 중이면 같이 넘긴다."""
+    info.setdefault("sat", _scenery)
+    return view3d.render(view, sc, ac, trail, ctrl, cam, hand, phase, t, info, fx)
+
+
+def use_airport(code) -> float:
+    """그 공항 주변의 위성 사진을 깔고, 시뮬레이션의 활주로를 실제 활주로에 맞춘다.
+
+    돌려주는 값은 실제 활주로 방향(도). 시뮬레이션의 북쪽이 그 방향이 된다. 위성 사진을 쓰지 않거나
+    활주로 자료가 없는 공항이면 0 (예전처럼 북쪽 활주로).
+    """
+    heading = 0.0
+    if _scenery is not None:
+        if code in satellite.RUNWAYS:
+            lat, lon, heading = satellite.RUNWAYS[code][:3]
+        else:
+            lat, lon = airway.AIRPORTS[code][1:3]
+        _scenery.set_airport(lat, lon, heading, key=code)
+    ck.HEADING_OFFSET = heading
+    return heading
 
 CONSENT_TEXT = """
 ==================================================================
@@ -645,11 +674,57 @@ def next_trial_no(path: Path, participant: str) -> int:
 PARTICIPANT_HELP = "참가자 ID는 익명 코드 형식이어야 합니다 (영문 1~4자 + 숫자 1~4자리, 예: P001)."
 
 
+def ask(prompt: str) -> str:
+    """터미널에서 한 줄을 입력받는다. input()과 같지만 ESC를 누르면 바로 프로그램을 끝낸다.
+
+    창이 뜨기 전의 메뉴에서도 ESC로 나갈 수 있게 하려는 것이다. 터미널이 아니면(파이프 등) input()을 쓴다.
+    """
+    if not sys.stdin.isatty():
+        return input(prompt)
+    import codecs
+    import select
+    import termios
+    import tty
+    import unicodedata
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+    width = lambda ch: 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+    chars = []
+    print(prompt, end="", flush=True)
+    try:
+        tty.setcbreak(fd)   # 글자를 누르는 즉시 받는다 (Ctrl+C는 그대로 동작)
+        while True:
+            byte = os.read(fd, 1)
+            if byte in (b"", b"\x04"):          # 입력 끝 (Ctrl+D)
+                raise EOFError
+            if byte == b"\x1b":
+                if select.select([fd], [], [], 0.05)[0]:   # 방향키 같은 조합 키: 버린다
+                    os.read(fd, 16)
+                    continue
+                raise SystemExit("\nESC를 눌러 종료합니다.")
+            if byte in (b"\r", b"\n"):
+                print()
+                return "".join(chars)
+            if byte in (b"\x7f", b"\x08"):      # 지우기
+                if chars:
+                    w = width(chars.pop())
+                    print("\b" * w + " " * w + "\b" * w, end="", flush=True)
+                continue
+            ch = decoder.decode(byte)
+            if ch and ch.isprintable():
+                chars.append(ch)
+                print(ch, end="", flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
 def ask_participant() -> str:
     """--participant 없이 실행한 경우(예: VS Code ▶ 버튼) 터미널에서 익명 코드를 입력받는다."""
     while True:
         try:
-            code = input("익명 참가자 코드를 입력하세요 (예: P001, 이름은 넣지 마세요): ").strip()
+            code = ask("익명 참가자 코드를 입력하세요 (예: P001, 이름은 넣지 마세요): ").strip()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\n참가자 코드가 없어 실험을 시작하지 않습니다.")
         if PARTICIPANT_RE.match(code):
@@ -661,7 +736,7 @@ def ask_consent(participant: str, output: Path) -> bool:
     """동의 안내문을 출력하고 참가자의 명시적 동의를 받는다. 동의하지 않으면 False."""
     print(CONSENT_TEXT.format(participant=participant, output=output.name))
     try:
-        answer = input("위 내용을 읽고 실험 참여에 동의하십니까? (y/n): ").strip().lower()
+        answer = ask("위 내용을 읽고 실험 참여에 동의하십니까? (y/n): ").strip().lower()
     except EOFError:   # 입력을 받을 수 없는 환경이면 동의하지 않은 것으로 처리
         answer = ""
     return answer in CONSENT_YES
@@ -669,7 +744,7 @@ def ask_consent(participant: str, output: Path) -> bool:
 
 FLIGHT_MODES = {
     "staged": "단계별 시뮬레이션 - 이륙 → 직선 → 선회 → 착륙 과제를 차례로 수행 (실험 기록 저장)",
-    "free": "자유 비행         - 과제 없이 손으로 자유롭게 비행 (기록 없음)",
+    "free": "자유 비행         - 손으로 직접 조종: 공항에서 공항으로 가는 실제 항로 비행 또는 공항 주변 비행 (기록 없음)",
     "auto": "자동 조종         - 컴퓨터가 실제 항로(예: 인천 → 로스앤젤레스)를 비행, 지켜보기 (카메라·기록 없음)",
 }
 VIEW_HELP = ("화면 시점: 마우스 드래그·트랙패드 두 손가락 스크롤·방향키(또는 4 6 8 2) = 회전,\n"
@@ -677,6 +752,7 @@ VIEW_HELP = ("화면 시점: 마우스 드래그·트랙패드 두 손가락 스
              "           1 3 7 9 = 미리 정한 시점, 5 = 기본 시점, V = 3D/2D 전환,\n"
              "낮/밤 전환: N 키 또는 화면 위 가운데의 DAY/NIGHT 버튼 클릭\n"
              "날씨 전환: W 키 또는 그 옆의 날씨 버튼 클릭\n"
+             "지면 전환: E 키 (실제 위성 사진 <-> 모형 도시·공항)\n"
              "조종석 시점: C 키 (뒤에서 따라가는 시점과 전환, 조종석에서는 드래그로 고개 돌리기)\n"
              "기체 계통: F = 플랩 다음 단계, G = 착륙 장치 올림/내림\n"
              "손 중립 다시 잡기: 손을 편하게 든 자세에서 Z 키 (시작할 때 한 번은 자동으로 잡습니다)\n"
@@ -691,7 +767,7 @@ def ask_flight_mode() -> str:
         print(f"  {i}) {FLIGHT_MODES[name]}")
     while True:
         try:
-            answer = input(f"번호 입력 (1~{len(names)}): ").strip().lower()
+            answer = ask(f"번호 입력 (1~{len(names)}): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\n비행 모드를 고르지 않아 시작하지 않습니다.")
         if answer in names:
@@ -714,7 +790,7 @@ def ask_weather() -> str:
         print(f"  {i}) {WEATHER_NAMES[name]}")
     while True:
         try:
-            answer = input(f"번호 입력 (1~{len(names)}, 그냥 Enter = 맑음): ").strip().lower()
+            answer = ask(f"번호 입력 (1~{len(names)}, 그냥 Enter = 맑음): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\n날씨를 고르지 않아 시작하지 않습니다.")
         if answer == "":
@@ -739,7 +815,7 @@ def ask_cam() -> str:
         print(f"  {i}) {CAMS[name]}")
     while True:
         try:
-            answer = input(f"번호 입력 (1~{len(names)}, 그냥 Enter = 외부 시점): ").strip().lower()
+            answer = ask(f"번호 입력 (1~{len(names)}, 그냥 Enter = 외부 시점): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\n시점을 고르지 않아 시작하지 않습니다.")
         if answer == "":
@@ -759,7 +835,7 @@ def ask_time() -> str:
         print(f"  {i}) {TIMES[name]}")
     while True:
         try:
-            answer = input(f"번호 입력 (1~{len(names)}, 그냥 Enter = 낮): ").strip().lower()
+            answer = ask(f"번호 입력 (1~{len(names)}, 그냥 Enter = 낮): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\n시간대를 고르지 않아 시작하지 않습니다.")
         if answer == "":
@@ -993,15 +1069,43 @@ def main_staged(args, parser):
         if rows and not quit_requested:
             show_summary(inp, rows, info)
     finally:
+        close_window()   # 창부터 닫는다 (카메라 정리가 늦어져도 바로 꺼진 것처럼 보이게)
         inp.close()
-        close_window()
     print(f"{saved}개 시도를 {args.output}에 저장했습니다.")
     if saved and not args.no_tracks:
         print(f"비행 궤적은 {track_dir} 폴더에 시도별 파일로 저장했습니다.")
 
 
+FREE_KINDS = {"route": "공항에서 공항으로 - 실제 공항 두 곳을 골라 이륙·순항·착륙까지 직접 조종",
+              "local": "공항 주변 자유 비행 - 목적지 없이 마음대로 비행 (교관석 기능 포함)"}
+
+
+def ask_free_kind() -> str:
+    names = list(FREE_KINDS)
+    print("자유 비행 방식을 고르세요")
+    for i, name in enumerate(names, 1):
+        print(f"  {i}) {FREE_KINDS[name]}")
+    while True:
+        try:
+            answer = ask(f"번호 입력 (1~{len(names)}, 그냥 Enter = 1번): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\n방식을 고르지 않아 시작하지 않습니다.")
+        if answer == "":
+            return names[0]
+        if answer in names:
+            return answer
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        print(f"1~{len(names)} 중에서 골라 주세요.")
+
+
 def main_free(args):
-    """자유 비행: 손으로 조종하지만 과제도 기록도 없다."""
+    """자유 비행: 손으로 조종하지만 과제도 기록도 없다.
+
+    공항에서 공항으로 가는 항로 비행(main_airway)과 공항 주변 자유 비행 중에서 고른다.
+    """
+    if args.origin or args.dest or (not args.local and ask_free_kind() == "route"):
+        return main_airway(args, manual=True)
     print("자유 비행 모드입니다. 과제나 판정 없이 자유롭게 비행합니다.")
     print("웹캠 영상은 손 인식을 위해 메모리에서만 처리되며 저장되지 않습니다. 비행 기록도 남기지 않습니다.")
     print("교관석 기능 (키): P = 일시 정지,  X = 엔진 고장 걸기/풀기,  T = 강한 돌풍 주입\n"
@@ -1017,15 +1121,104 @@ def main_free(args):
         open_window()
         landings = run_free(inp, info, random.Random(args.seed))
     finally:
+        close_window()   # 창부터 닫는다 (카메라 정리가 늦어져도 바로 꺼진 것처럼 보이게)
         inp.close()
-        close_window()
     print(f"자유 비행을 마쳤습니다 (착륙 {landings}회). 기록은 저장하지 않았습니다.")
 
 
 # ---------------------------------------------------------------- 실제 항로 비행 (자동 조종)
 
-ENROUTE_LOW_ALT = 150.0        # 이 고도까지는 화면도 실제 고도 그대로 그린다 (m)
-ENROUTE_ALT_SCALE = 0.051      # 그 위로는 화면의 고도를 줄여 그린다 (10,700 m -> 약 690 m)
+ENROUTE_CRUISE_VISUAL = 690.0  # 순항 고도를 화면에서 이 고도로 줄여 그린다 (m)
+ENROUTE_LOCAL_ALT = 1500.0     # 이 고도를 넘으면 출발 공항 주변 풍경에서 순항 풍경으로 넘어간다 (m)
+DISSOLVE_FRAMES = 40           # 장면이 바뀔 때 겹쳐 넘기는 프레임 수
+_dissolve = {"last": None, "from": None, "left": 0}
+
+
+def show_frame(img):
+    """화면에 그린다. 장면 전환 중이면 앞 장면과 겹쳐서 서서히 넘긴다 (시간을 건너뛰는 표현)."""
+    out = img
+    if _dissolve["left"] > 0 and _dissolve["from"] is not None:
+        k = _dissolve["left"] / DISSOLVE_FRAMES
+        out = cv2.addWeighted(_dissolve["from"], k, img, 1.0 - k, 0)
+        _dissolve["left"] -= 1
+    _dissolve["last"] = img
+    cv2.imshow(WINDOW_NAME, out)
+
+
+def start_dissolve():
+    _dissolve["from"], _dissolve["left"] = _dissolve["last"], DISSOLVE_FRAMES
+
+
+MANUAL_DEPART_ALT = 250.0         # 손으로 조종할 때 순항으로 넘어가는 고도 (m)
+MANUAL_DEPART_DISTANCE = 3500.0   # 그리고 공항에서 이만큼 멀어져야 한다 (m)
+CRUISE_STEER_RATE = 14.0          # 순항 중 roll ±1일 때 기수가 항로에서 벗어나는 속도 (도/초)
+CRUISE_STEER_MAX = 25.0           # 순항 중 항로에서 벗어날 수 있는 최대 각도 (도)
+CRUISE_SIDE_SPEED = 70.0          # 그때 옆으로 움직이는 속도의 기준 (화면 기준 m/s)
+CRUISE_SIDE_MAX = 400.0           # 항로에서 옆으로 벗어날 수 있는 최대 거리 (화면 기준 m)
+
+
+def run_leg(inp, sc, ac, info, rng):
+    """항로 비행의 출발·도착 구간: 공항 주변을 실제 물리 모델로 난다. (결과, 중단 여부) 반환.
+
+    과제 판정 화면(준비·GO·결과) 없이 이어서 난다. 지상에서 끝나면(착륙) 멈출 때까지 굴러가는 모습을 보인다.
+    """
+    ctrl = inp.ctrl
+    manual = not hasattr(inp, "fly")   # 손으로 조종 (자유 비행). 아니면 자동 조종
+    guide = Autopilot() if manual and info.get("guide", True) else None
+    env = None
+    if ENVIRONMENTS[info["env"]] is not None:
+        env = Environment(info["env"], info["wind_from"], seed=rng.random())
+    fx = FlightEffects(ac, ctrl, env, info.get("motion", True))
+    trail = [(ac.x, ac.y, ac.alt)]
+    info["fd"] = None
+    t = 0.0
+    last = time.monotonic()
+    result_until = None
+    try:
+        while True:
+            got = inp.read()
+            if got is None:
+                return sc.outcome, True
+            cam, hand = got
+            now = time.monotonic()
+            dt, last = min(now - last, 0.1), now
+            if result_until is None:
+                if manual:
+                    if guide is not None:   # 조종 안내 십자선: 경로와 고도를 지키려면 넣어야 할 입력
+                        want_roll, want_pitch = guide.guidance(sc, ac)
+                        info["fd"] = (want_roll - ctrl.roll, want_pitch - ctrl.pitch)
+                else:
+                    inp.fly(sc, ac)
+                t += dt
+                event = ac.step(ctrl.roll, ctrl.throttle, dt, env, ctrl.pitch)
+                sc.update(ac, event, t)
+                # 손으로 조종할 때는 경로를 정확히 따르지 않아도, 충분히 올라가 공항을 벗어나면 순항으로 넘어간다
+                if (manual and not sc.done and isinstance(sc, Departure)
+                        and ac.alt >= MANUAL_DEPART_ALT and np.hypot(ac.x, ac.y) >= MANUAL_DEPART_DISTANCE):
+                    sc.finish("success", t=t)
+                if sc.done:
+                    info["fd"] = None
+                    if ac.airborne and sc.outcome == "success":
+                        return sc.outcome, False       # 공중에서 끝났으면 바로 다음 구간으로
+                    result_until = now + ROLLOUT_SECONDS
+            else:
+                if now >= result_until:
+                    return sc.outcome, False
+                event = coast(ac, ctrl, dt, env)
+            if np.hypot(ac.x - trail[-1][0], ac.y - trail[-1][1]) > 5:
+                trail.append((ac.x, ac.y, ac.alt))
+            fx.update(ac, ctrl, event, dt)
+            show_frame(render(_view, sc, ac, trail, ctrl, cam, hand,
+                              "run" if result_until is None else "result", t, info, fx))
+            if user_wants_quit():
+                return sc.outcome, True
+            while _keys:
+                key = _keys.pop()
+                if manual and key in (ord("r"), ord("R")):   # 이 구간을 처음부터 다시
+                    return "restart", False
+                system_key(key, ac, inp)
+    except KeyboardInterrupt:
+        return sc.outcome, True
 ENROUTE_BLEND_SECONDS = 1.5    # 해안을 지날 때 바다와 육지가 바뀌는 데 걸리는 시간
 
 
@@ -1066,43 +1259,66 @@ GUIDE_AHEAD = 14000.0   # 순항 화면에서 길 안내선을 그리는 거리 
 GUIDE_STEP = 500.0
 
 
-def guide_path(route, km, ac, visual):
+def guide_path(route, km, ac, visual, anchor, frame_rot=0.0):
     """순항 화면의 길 안내선: 지금 위치에서 앞으로 이어지는 항로 (화면 좌표, 기체보다 조금 아래).
 
     화면은 축소해서 그리므로, 화면의 거리를 실제 거리로 바꿔 그 지점의 진행 방위를 따라 이어 간다.
     """
     real_per_visual = ac.alt / max(visual.alt, 1.0)   # 화면 1 m가 실제 몇 m인지
     z = visual.alt - 60.0   # 조종사 시점에서도 앞으로 뻗은 선으로 보이도록 기체보다 충분히 아래에 둔다
-    x, y = visual.x, visual.y
+    x, y = anchor   # 항로 위의 현재 지점 (기체가 옆으로 벗어나도 차선은 항로에 그대로 있다)
     pts = [(x, y, z)]
     for i in range(int(GUIDE_AHEAD / GUIDE_STEP)):
         ahead_km = km + (i + 0.5) * GUIDE_STEP * real_per_visual / 1000.0
         if ahead_km >= route.distance:
             break
-        h = math.radians(route.bearing(ahead_km / route.distance))
+        h = math.radians(route.bearing(ahead_km / route.distance) - frame_rot)
         x, y = x + GUIDE_STEP * math.sin(h), y + GUIDE_STEP * math.cos(h)
         pts.append((x, y, z))
     return pts
 
 
-def run_enroute(inp, route, maps, info, rng) -> bool:
+CRUISE_VISUAL_SPEED = 6.0     # 순항 중 지면이 흐르는 속도 (실제의 몇 배로 보여줄지)
+CRUISE_SCENE_SECONDS = 8.0    # 위성 사진 지면: 이 시간마다 실제 위치의 풍경으로 넘어간다 (시간 건너뛰기)
+
+
+def run_enroute(inp, route, maps, info, rng, start, frame_rot=0.0) -> bool:
     """순항 구간: 대권 항로를 따라 실제 고도·속도로 날되 시간을 압축해 보여준다. 중단을 원하면 True.
+
+    start = 출발 구간을 마친 기체. 그 위치·고도·속도에서 끊김 없이 이어받는다. 낮은 고도에서는
+    출발 공항 주변 풍경을 그대로 그리다가, 높이 올라가면 순항 풍경(바다·육지)으로 넘어간다.
 
     기체 상태(ac)는 실제 값(고도 10 km, 속도 250 m/s)이고 계기도 그 값을 보인다. 3D 화면은 고도를
     줄인 별도의 기체(visual)로 그린다: 실제 축척으로는 지면이 전부 안개에 묻혀 보이지 않기 때문이다.
     """
     sc = EnrouteView(route)
     ctrl = inp.ctrl
-    ctrl.roll = ctrl.pitch = 0.0
+    manual = not hasattr(inp, "fly")   # 손으로 조종: 좌우 기울임으로 항로(안내 차선) 위를 지킨다
+    if not manual:
+        ctrl.roll = ctrl.pitch = 0.0
+    rx, ry = start.x, start.y          # 항로 위의 현재 지점 (화면 좌표). 기체는 여기서 옆으로 벗어날 수 있다
+    off_angle = off_side = 0.0         # 항로에서 벗어난 각도(도)와 옆 거리(m, 오른쪽 +)
     total = route.flight_seconds
     warp = total / route.show_seconds
     env = None
     if ENVIRONMENTS[info["env"]] is not None:
         env = Environment(info["env"], info["wind_from"], seed=rng.random())
-    ac = Aircraft(x=0.0, y=0.0, heading=route.bearing(0.0), speed=route.airspeed(0.0),
+    # frame_rot = 화면 좌표의 북쪽이 실제로 향하는 방위 (출발 공항의 활주로 방향). ac.heading은 실제 방위다
+    ac = Aircraft(x=0.0, y=0.0, heading=(start.heading + frame_rot) % 360.0, speed=route.airspeed(0.0),
                   alt=route.altitude(0.0), airborne=True)
     ac.physical = True
-    visual = Aircraft(x=0.0, y=0.0, heading=ac.heading, speed=ac.speed, alt=ac.alt, airborne=True)
+    visual = Aircraft(x=start.x, y=start.y, heading=start.heading, speed=ac.speed, alt=ac.alt, airborne=True)
+
+    def visual_alt(alt, km):
+        """화면에 그릴 고도: 순항 구간이 시작·끝나는 고도는 그대로, 순항 고도는 ENROUTE_CRUISE_VISUAL로."""
+        low = route.start_alt if km < route.distance / 2 else route.end_alt
+        top = max(ENROUTE_CRUISE_VISUAL, low + 50.0)
+        return low + (alt - low) * (top - low) / max(route.cruise_alt - low, 1.0)
+
+    local = True                                # 아직 출발 공항 주변 풍경을 그리는 중
+    shown_km = 0.0                              # 지금 화면에 보이는 풍경의 위치 (항로 위 거리)
+    scene_until = 0.0                           # 다음에 풍경을 실제 위치로 맞출 시각
+    ck.HEADING_OFFSET = 0.0                     # 순항 중 계기의 방위는 실제 방위 그대로
     fx = FlightEffects(ac, ctrl, env, info.get("motion", True))
     land = 1.0
     hint = info.get("hint")
@@ -1111,9 +1327,11 @@ def run_enroute(inp, route, maps, info, rng) -> bool:
     quit_requested = False
     try:
         while sc.km < route.distance:
-            if inp.read() is None:
+            got = inp.read()
+            if got is None:
                 quit_requested = True
                 break
+            cam, hand = got
             now = time.monotonic()
             dt, last = min(now - last, 0.1), now
             # 이번 프레임에 흐른 실제 시간. 상승·강하 구간은 천천히 보여준다 (순항의 1/5 속도에서 시작)
@@ -1125,27 +1343,59 @@ def run_enroute(inp, route, maps, info, rng) -> bool:
             ac.vs = (new_alt - ac.alt) / sim_dt if sim_dt > 0 else 0.0
             ac.alt, ac.speed = new_alt, route.airspeed(sc.km)
             ac.ground_speed = route.ground_speed(sc.km)
-            ac.heading = route.bearing(frac)
-            ctrl.throttle = 75 if ac.vs > 1.0 else 25 if ac.vs < -1.0 else 50
+            # 출발 구간에서 넘겨받은 기수 방위에서 항로 방위로 부드럽게 맞춰 간다
+            want = route.bearing(frac)
+            ac.heading = (want if not local else
+                          ac.heading + wrap(want - ac.heading) * min(dt / 1.0, 1.0)) % 360.0
+            if manual:
+                off_angle = float(np.clip(off_angle + ctrl.roll * CRUISE_STEER_RATE * dt,
+                                          -CRUISE_STEER_MAX, CRUISE_STEER_MAX))
+                off_side = float(np.clip(off_side + CRUISE_SIDE_SPEED * math.sin(math.radians(off_angle)) * dt,
+                                         -CRUISE_SIDE_MAX, CRUISE_SIDE_MAX))
+                ac.bank = ctrl.roll * 25.0
+                sc.side = off_side
+                if info.get("guide", True):   # 조종 안내: 차선 가운데로 돌아오려면 넣어야 할 좌우 입력
+                    want = float(np.clip(-off_side / 80.0 - off_angle / 10.0, -1.0, 1.0))
+                    info["fd"] = (want - ctrl.roll, 0.0)
+            else:
+                ctrl.throttle = 75 if ac.vs > 1.0 else 25 if ac.vs < -1.0 else 50
             if env is not None:
                 env.step(min(ac.alt, 500.0), dt)
             # 화면용 기체: 고도를 줄이고, 지면이 흐르는 속도도 같은 비율로 줄인다
-            visual.alt = min(ac.alt, ENROUTE_LOW_ALT + (ac.alt - ENROUTE_LOW_ALT) * ENROUTE_ALT_SCALE)
-            step = ac.ground_speed * (visual.alt / ac.alt) * dt
-            h = math.radians(ac.heading)
-            visual.x, visual.y = visual.x + step * math.sin(h), visual.y + step * math.cos(h)
-            visual.heading, visual.speed = ac.heading, ac.speed
+            visual.alt = visual_alt(ac.alt, sc.km)
+            scale = visual.alt / ac.alt          # 화면 1 m / 실제 1 m
+            moved = ac.ground_speed * dt * (1.0 if local else CRUISE_VISUAL_SPEED)   # 화면에 보여줄 이동 (실제 m)
+            shown_km = min(shown_km + moved / 1000.0, route.distance)
+            if local and ac.alt > ENROUTE_LOCAL_ALT:
+                local = False
+                scene_until = 0.0
+            if not local and now >= scene_until:   # 풍경을 실제 위치로 건너뛴다 (겹쳐 넘기기)
+                scene_until = now + CRUISE_SCENE_SECONDS
+                shown_km = sc.km
+                start_dissolve()
+                if _scenery is not None:
+                    _scenery.set_cruise(*route.position(shown_km / route.distance), (rx, ry), frame_rot, scale,
+                                        recenter=True)
+            if _scenery is not None and not local:
+                _scenery.set_cruise(*route.position(shown_km / route.distance), (rx, ry), frame_rot, scale)
+                # 다음에 건너뛸 지점의 사진을 미리 받아 둔다
+                ahead = sc.km + route.ground_speed(sc.km) * sim_dt / max(dt, 1e-6) * (scene_until - now) / 1000.0
+                _scenery.prefetch(*route.position(min(ahead / route.distance, 1.0)))
+            step = moved * scale
+            h = math.radians(ac.heading - frame_rot)
+            rx, ry = rx + step * math.sin(h), ry + step * math.cos(h)
+            visual.x, visual.y = rx + off_side * math.cos(h), ry - off_side * math.sin(h)
+            visual.heading, visual.speed = ac.heading - frame_rot + off_angle, ac.speed
             # 공항 근처는 항상 육지로 본다 (거친 해안선으로는 바닷가 공항이 바다 위로 판정되기도 한다)
             near_airport = min(sc.km, route.distance - sc.km) < 40.0
             target = 1.0 if near_airport or airway.over_land(*route.position(frac)) else 0.0
             land += (target - land) * min(dt / ENROUTE_BLEND_SECONDS, 1.0)
             info["airway"] = {"map": maps[0], "minimap": maps[1], "frac": frac, "land": land,
-                              "visual": visual, "guide": guide_path(route, sc.km, ac, visual),
+                              "visual": visual, "local": local, "guide": guide_path(route, sc.km, ac, visual, (rx, ry), frame_rot),
                               "banner": f"TO {route.dest}   {route.distance - sc.km:,.0f} km   "
                                         f"{airway.format_hm(max(total - sc.elapsed, 0.0))} LEFT"}
             fx.update(ac, ctrl, None, dt)
-            cv2.imshow(WINDOW_NAME,
-                       render(_view, sc, ac, [], ctrl, None, True, "run", sc.elapsed, info, fx))
+            show_frame(render(_view, sc, ac, [], ctrl, cam, hand, "run", sc.elapsed, info, fx))
             if user_wants_quit():
                 quit_requested = True
                 break
@@ -1153,6 +1403,7 @@ def run_enroute(inp, route, maps, info, rng) -> bool:
     except KeyboardInterrupt:
         quit_requested = True
     info["airway"] = None
+    info["fd"] = None
     info["hint"] = hint
     return quit_requested
 
@@ -1170,7 +1421,7 @@ def ask_airport(prompt, exclude=None) -> str:
     print(f"  이 밖의 공항(전 세계 {len(airway.AIRPORTS):,}곳)은 공항 코드(예: AMS)나 영문 도시 이름(예: paris)을 입력하세요.")
     while True:
         try:
-            answer = input("번호, 공항 코드 또는 도시 이름: ").strip()
+            answer = ask("번호, 공항 코드 또는 도시 이름: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\n공항을 고르지 않아 시작하지 않습니다.")
         if answer.isdigit():
@@ -1222,11 +1473,23 @@ def ask_route(origin=None, dest=None):
         origin = dest = None
 
 
-def main_airway(args):
-    """자동 조종 - 실제 항로 비행: 출발 공항 이륙 -> 순항(시간 압축) -> 도착 공항 착륙."""
+def main_airway(args, manual=False):
+    """실제 항로 비행: 출발 공항 이륙 -> 순항(시간 압축) -> 도착 공항 착륙.
+
+    manual=False면 자동 조종이 비행하고, True면 자유 비행으로 사람이 손동작으로 조종한다.
+    """
     route = ask_route(args.origin, args.dest)
     origin, dest = airway.AIRPORTS[route.origin][0], airway.AIRPORTS[route.dest][0]
-    print("자동 조종 모드입니다. 컴퓨터가 실제 항로를 따라 스스로 비행합니다. 카메라는 켜지 않고 기록도 남기지 않습니다.")
+    if manual:
+        print("\n자유 비행 - 공항에서 공항으로: 손동작으로 직접 조종해 출발 공항에서 도착 공항까지 갑니다.")
+        print("웹캠 영상은 손 인식을 위해 메모리에서만 처리되며 저장되지 않습니다. 비행 기록도 남기지 않습니다.")
+        print("  1) 이륙: 손을 펴서 추력을 올리고, 뜨면 분홍색 경로를 따라 항로 방향으로 선회합니다.")
+        print("     고도 250 m 이상으로 공항에서 3.5 km 이상 멀어지면 순항으로 넘어갑니다.")
+        print("  2) 순항: 손을 좌우로 기울여 분홍색 안내 차선 가운데를 지킵니다 (고도와 속도는 자동).")
+        print("  3) 도착: 경로를 따라 선회해 활주로에 직접 착륙합니다.")
+        print("  분홍 십자선을 가운데에 맞추면 경로를 지킵니다. R 키 = 지금 구간을 처음부터 다시.")
+    else:
+        print("자동 조종 모드입니다. 컴퓨터가 실제 항로를 따라 스스로 비행합니다. 카메라는 켜지 않고 기록도 남기지 않습니다.")
     print(f"항로: {route.label}")
     print(f"  거리 {route.distance:,.0f} km, 순항 고도 {route.cruise_alt:,.0f} m, "
           f"실제 비행 시간 약 {airway.format_hm(route.flight_seconds)} "
@@ -1234,39 +1497,60 @@ def main_airway(args):
     print("  V 키: 3D 화면 <-> 항로 지도\n")
     print(VIEW_HELP)
     print_environment(args)
-    info = {"participant": "AUTOPILOT", "mode": "auto", "subtitle": f"{route.origin} > {route.dest}   NOT RECORDED",
-            "session_id": "", "trial_label": "FLIGHT", "autopilot": True, "airway": None,
-            "env": args.env, "wind_from": args.wind_from, "motion": not args.no_motion}
+    info = {"participant": "FREE FLIGHT" if manual else "AUTOPILOT", "mode": args.mode if manual else "auto",
+            "subtitle": f"{route.origin} > {route.dest}   NOT RECORDED",
+            "session_id": "", "trial_label": "FLIGHT", "autopilot": not manual, "airway": None,
+            "env": args.env, "wind_from": args.wind_from, "motion": not args.no_motion,
+            "guide": not args.no_guide}
     maps = (airway.RouteMap(route, ck.MAP_W, ck.CANVAS_H), airway.RouteMap(route, 170, 170, labels=False))
     rng = random.Random(args.seed)
-    inp = AutoInput(args)
+    if manual:
+        forbid_frame_saving()
+    inp = MODES[args.mode](args) if manual else AutoInput(args)
+    repeats = args.repeats or (1 if manual else None)   # 손 조종은 한 번, 자동 조종은 창을 닫을 때까지 반복
     flights = 0
     try:
         open_window()
         quit_requested = False
-        while not quit_requested and (args.repeats is None or flights < args.repeats):
+        while not quit_requested and (repeats is None or flights < repeats):
             flights += 1
             info["trial_no"] = flights
-            inp.new_trial()
-            print(f"[항로 비행 {flights}] {origin} 이륙")
+            if not manual:
+                inp.new_trial()
+            print(f"[항로 비행 {flights}] {origin} 이륙, 항로 방향({route.bearing(0.0):03.0f}도)으로 선회")
             info["hint"] = f"DEPARTURE: {origin} ({route.origin})"
-            row, quit_requested = run_trial(inp, "takeoff", info, rng)
-            if quit_requested or row is None or row["outcome"] != "success":
-                continue
-            print(f"[항로 비행 {flights}] 순항 시작")
-            quit_requested = run_enroute(inp, route, maps, info, rng)
+            runway = use_airport(route.origin)   # 출발 공항의 실제 활주로 방향
+            departure = Departure(route.bearing(0.0) - runway)
+            departure.name = f"DEPART {route.origin}"
+            ac = departure.initial_aircraft()
+            outcome, quit_requested = run_leg(inp, departure, ac, info, rng)
             if quit_requested:
                 break
-            inp.new_trial()
+            if outcome != "success":
+                print(f"[항로 비행 {flights}] 이륙을 다시 시작합니다. {departure.reason}")
+                flights -= 1
+                continue
+            print(f"[항로 비행 {flights}] 순항 시작")
+            route.start_alt, route.start_speed = ac.alt, ac.speed
+            quit_requested = run_enroute(inp, route, maps, info, rng, ac, runway)
+            if quit_requested:
+                break
             print(f"[항로 비행 {flights}] {dest} 접근")
             info["hint"] = f"ARRIVAL: {dest} ({route.dest})"
-            row, quit_requested = run_trial(inp, "landing", info, rng)
-            if row is not None and row["outcome"] != "aborted":
-                print(f"[항로 비행 {flights}] {dest} 착륙: {row['outcome']}  {row['fail_reason']}")
+            outcome = "restart"
+            while outcome == "restart" and not quit_requested:   # R 키: 도착 구간을 처음부터 다시
+                if not manual:
+                    inp.new_trial()
+                arrival = Arrival(route.bearing(1.0) - use_airport(route.dest))
+                arrival.name = f"ARRIVE {route.dest}"
+                start_dissolve()
+                outcome, quit_requested = run_leg(inp, arrival, arrival.initial_aircraft(), info, rng)
+            if outcome is not None:
+                print(f"[항로 비행 {flights}] {dest} 착륙: {outcome}  {arrival.reason}")
     finally:
+        close_window()   # 창부터 닫는다 (카메라 정리가 늦어져도 바로 꺼진 것처럼 보이게)
         inp.close()
-        close_window()
-    print("자동 조종을 마쳤습니다. 기록은 저장하지 않았습니다.")
+    print(("자유 비행을" if manual else "자동 조종을") + " 마쳤습니다. 기록은 저장하지 않았습니다.")
 
 
 def main_auto(args):
@@ -1303,8 +1587,8 @@ def main_auto(args):
                 if quit_requested:
                     break
     finally:
+        close_window()   # 창부터 닫는다 (카메라 정리가 늦어져도 바로 꺼진 것처럼 보이게)
         inp.close()
-        close_window()
     print("자동 조종을 마쳤습니다. 기록은 저장하지 않았습니다.")
 
 
@@ -1325,9 +1609,16 @@ def main():
                              "기본값: 단계별은 all. 자동 조종은 생략하면 실제 항로 비행(--from, --to), "
                              "주면 그 과제를 자동 조종으로 수행 (자유 비행은 과제 없음)")
     parser.add_argument("--from", dest="origin", type=airport_code, default=None, metavar="공항코드",
-                        help="자동 조종 항로 비행의 출발 공항 (세 글자 IATA 코드, 예: ICN). 생략하면 실행 후 고릅니다")
+                        help="자유 비행·자동 조종 항로 비행의 출발 공항 (세 글자 IATA 코드, 예: ICN). 생략하면 실행 후 고릅니다")
     parser.add_argument("--to", dest="dest", type=airport_code, default=None, metavar="공항코드",
                         help="자동 조종 항로 비행의 도착 공항 (예: LAX). 생략하면 실행 후 고릅니다")
+    parser.add_argument("--scenery", choices=["satellite", "model"], default="satellite",
+                        help="지면: satellite = 실제 위성 사진 (인터넷 필요, 처음 받은 뒤에는 저장된 것을 씀), "
+                             "model = 모형 도시와 공항. 실행 중 E 키로도 전환")
+    parser.add_argument("--airport", type=airport_code, default="ICN", metavar="공항코드",
+                        help="단계별·공항 주변 비행의 배경이 되는 실제 공항 (기본 ICN). 위성 사진 지면에서만 의미가 있다")
+    parser.add_argument("--local", action="store_true",
+                        help="자유 비행을 공항 주변 비행으로 시작 (생략하면 실행 후 고릅니다)")
     parser.add_argument("--repeats", type=int, default=None,
                         help="시나리오(또는 full 묶음) 반복 횟수. 기본값: 단계별 1회, 자동 조종은 계속 반복")
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "trials.csv")
@@ -1375,6 +1666,12 @@ def main():
 
     # 참가자 코드를 준 경우는 실험이므로 묻지 않고 단계별 시뮬레이션으로 간다
     flight = args.flight or ("staged" if args.participant else ask_flight_mode())
+    global _scenery
+    if args.scenery == "satellite":
+        _scenery = satellite.Scenery()
+        use_airport(args.airport)
+        print(f"지면: 실제 위성 사진 ({airway.AIRPORTS[args.airport][3]} 공항 주변부터 인터넷에서 받아 옵니다. "
+              "E 키 = 모형 풍경과 전환)")
     _view.mode = args.view
     _view.night = (args.time or ask_time()) == "night"
     print(f"시간대: {'밤' if _view.night else '낮'}\n")

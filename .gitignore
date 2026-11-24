@@ -5,3 +5,4 @@ trials.csv
 results/
 trials.csv.bak*
 tracks/
+cache/
